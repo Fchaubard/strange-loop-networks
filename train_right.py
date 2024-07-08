@@ -41,21 +41,22 @@ if __name__ == '__main__':
     
     right_model_directory = "./right_checkpoints/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
     
+    macro_batch_size = 5 
     pad_tok = '[PAD]'
-    
+
     # Initialize wandb
     wandb_project_name = "reward_training_pythia_"+model_id.replace("/","_")
-    
-    lr = 1e-5
-    weight_decay = 0.01
-    betas = (0.999,0.9999)
-    
+
+    lr = 1e-4
+    weight_decay = 0.0001
+    betas = (0.99,0.999)
+
     # for scheduler
     factor=0.5
-    patience=50
-    cooldown=50
+    patience=200
+    cooldown=200
 
-    max_microbatch_size = 1
+    max_microbatch_size = 2 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
 
     save_checkpoint_every_n_batches = 100
     
@@ -205,26 +206,29 @@ if __name__ == '__main__':
             iterss +=1
             # message = {"per iter loss": loss.item(), "per iter acc": per_sample_acc, "batch_size":input_ids.size(0),"batch_seq_size":input_ids.size(1), "iterss":iterss}
             # print(message)
-        normed_grad = torch.nn.utils.clip_grad_norm_(current_right_model.parameters(), max_norm=1.).item()
-        normed_grad_r = torch.nn.utils.clip_grad_norm_(reward_layer.parameters(), max_norm=1.).item()
-        # Print detailed gradient norms
-        
-        # for name, param in current_right_model.named_parameters():
-        #     if param.grad is not None:
-        #         normed_grad_param = param.grad.norm().item()
-        #         print(f"Gradient norm for {name}: {normed_grad_param}")
-        # for name, param in reward_layer.named_parameters():
-        #     if param.grad is not None:
-        #         normed_grad_param = param.grad.norm().item()
-        #         print(f"Gradient norm for {name}: {normed_grad_param}")
-        optimizer_right.step()
-        scheduler.step(total_loss)
-        
-        accuracy = total_correct / (input_ids.size(0) * input_ids.size(1))  # Per-token accuracy
-        message = {"right_BCE_loss": float(total_loss), "right_per_tok_acc": float(accuracy), "lr": optimizer_right.param_groups[0]['lr'], "norm_grad": float(normed_grad),"norm_grad_r": float(normed_grad_r)}
-        
-        wandb.log(message)
-        print(message)
+        if iterr % macro_batch_size == (macro_batch_size-1):
+
+            normed_grad = torch.nn.utils.clip_grad_norm_(current_right_model.parameters(), max_norm=1.).item()
+            normed_grad_r = torch.nn.utils.clip_grad_norm_(reward_layer.parameters(), max_norm=1.).item()
+            # Print detailed gradient norms
+    
+            # for name, param in current_right_model.named_parameters():
+            #     if param.grad is not None:
+            #         normed_grad_param = param.grad.norm().item()
+            #         print(f"Gradient norm for {name}: {normed_grad_param}")
+            # for name, param in reward_layer.named_parameters():
+            #     if param.grad is not None:
+            #         normed_grad_param = param.grad.norm().item()
+            #         print(f"Gradient norm for {name}: {normed_grad_param}")
+            optimizer_right.step()
+            scheduler.step(total_loss)
+            optimizer_right.zero_grad()
+
+            accuracy = total_correct / (input_ids.size(0) * input_ids.size(1))  # Per-token accuracy
+            message = {"right_BCE_loss": float(total_loss), "right_per_tok_acc": float(accuracy), "lr": optimizer_right.param_groups[0]['lr'], "norm_grad": float(normed_grad),"norm_grad_r": float(normed_grad_r)}
+
+            wandb.log(message)
+            print(message)
         
         iterr+=1
         num_batches_since_last_checkpoint += 1
