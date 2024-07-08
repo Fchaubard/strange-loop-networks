@@ -11,7 +11,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import random
 import numpy as np
 import pdb
-from datetime import datetime
+import datetime
 
 # UPDATE THIS TO WHERE YOUR https://github.com/Fchaubard/sentence_augs.git is cloned to:
 sys.path.append(os.path.abspath(os.path.join('..', 'sentence_augs')))
@@ -226,7 +226,7 @@ if __name__ == '__main__':
                                              samples_per_program=samples_per_program)
 
         # Save it to ./batches/batch_<timestamp>_<left_model_checkpoint_name>.pckl 
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
 
         # Create the filename
         filename = f"batch_{timestamp}_{left_model_checkpoint_name.replace('/','_')}.json"
