@@ -19,6 +19,8 @@ from datetime import datetime
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
+from torchvision.ops import sigmoid_focal_loss
+
 import wandb
 import os
 
@@ -132,7 +134,7 @@ if __name__ == '__main__':
     # prepare current_right_model for training
     
     current_right_model.train()
-    loss_fn = nn.CrossEntropyLoss()
+    #loss_fn = nn.CrossEntropyLoss()
 
     #------------------
     # Start training!
@@ -197,8 +199,17 @@ if __name__ == '__main__':
             # Calculate binary cross-entropy loss for each token
             microbatch_reward_masks_flat = microbatch_reward_masks.view(-1).long()
             outputs_flat = outputs.view(-1, 2)  # Flatten the outputs
-            loss_fn = nn.CrossEntropyLoss()
-            loss = loss_fn(outputs_flat, microbatch_reward_masks_flat.long())
+
+            #loss_fn = nn.CrossEntropyLoss()
+            #loss = loss_fn(outputs_flat, microbatch_reward_masks_flat.long())
+
+            targets_one_hot = F.one_hot(microbatch_reward_masks_flat, num_classes=2).float()
+            
+            
+            
+            # Calculate focal loss
+            loss = -1 * sigmoid_focal_loss(outputs_flat, targets_one_hot, alpha=2.0, gamma=4.0, reduction='mean')
+            #pdb.set_trace()
             
             # Backpropagation
             loss.backward(retain_graph=True)
@@ -231,7 +242,7 @@ if __name__ == '__main__':
             optimizer_right.zero_grad()
 
             accuracy = total_correct / (input_ids.size(0) * input_ids.size(1))  # Per-token accuracy
-            message = {"right_BCE_loss": float(total_loss), "right_per_tok_acc": float(accuracy), "lr": optimizer_right.param_groups[0]['lr'], "norm_grad": float(normed_grad),"norm_grad_r": float(normed_grad_r)}
+            message = {"right_BCE_loss": round(float(total_loss),2), "right_per_tok_acc": round(float(accuracy),2), "lr": optimizer_right.param_groups[0]['lr'], "norm_grad": round(float(normed_grad),2),"norm_grad_r": round(float(normed_grad_r),2)}
 
             wandb.log(message)
             print(message)
