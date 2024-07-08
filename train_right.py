@@ -17,6 +17,7 @@ import pdb
 import json
 from datetime import datetime
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from tqdm import tqdm
 
 import wandb
 import os
@@ -36,18 +37,18 @@ if __name__ == '__main__':
     device = 'cuda:0'#'cpu'#
 
     # update what model you want to use WARNING: IF YOU WANT TO START FROM A CHECKPOINT OF RIGHT MODEL, THIS IS THE PLACE TO DO IT:
-    model_id = "EleutherAI/pythia-1b" # "EleutherAI/pythia-70m-v0"
+    model_id = "EleutherAI/pythia-410M" #"EleutherAI/pythia-1b" # "EleutherAI/pythia-70m-v0"
     right_model_checkpoint_name = None # use this if you want to load from a checkpoint, else will load from pythia pretrained
     
     right_model_directory = "./right_checkpoints/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
     
-    macro_batch_size = 5 
+    macro_batch_size = 1 
     pad_tok = '[PAD]'
 
     # Initialize wandb
     wandb_project_name = "reward_training_pythia_"+model_id.replace("/","_")
 
-    lr = 1e-4
+    lr = 1e-5
     weight_decay = 0.0001
     betas = (0.99,0.999)
 
@@ -56,9 +57,9 @@ if __name__ == '__main__':
     patience=200
     cooldown=200
 
-    max_microbatch_size = 2 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
+    max_microbatch_size = 20 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
 
-    save_checkpoint_every_n_batches = 100
+    save_checkpoint_every_n_batches = 1000
     
     #------------------
     # DO SETUP:
@@ -145,6 +146,7 @@ if __name__ == '__main__':
     # then we want to train the model with binary cross entropy 
     num_batches_since_last_checkpoint = 0
     iterr=0
+    print("STARTING TRAINING")
     while True:
         # Load a batch from ./batches/*.json. Grab the top 100 most recent files, and then select randomly one of them.
         batch_files = sorted(glob.glob(os.path.join(batches_directory, '*.json')), key=os.path.getmtime, reverse=True)[:100]
@@ -158,7 +160,11 @@ if __name__ == '__main__':
         
         input_texts = [sample['input_text'] for sample in batch]
         reward_masks = [sample['reward_mask'] for sample in batch]
-        
+
+        maxx = max([len(sample['input_text']) for sample in batch])
+        if maxx > 2000:
+           print("MAXXXX LENGTH IS SURPASSED SO SKIPPING, MAXX: " + str(maxx) )
+           continue
         inputs = tokenizer(input_texts, return_tensors='pt', padding=True, truncation=True)
         input_ids = inputs['input_ids'].to(device)
         attention_mask = inputs['attention_mask'].to(device)
