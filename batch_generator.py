@@ -17,6 +17,9 @@ from datetime import datetime
 sys.path.append(os.path.abspath(os.path.join('..', 'sentence_augs')))
 from text_corrupter import text_corrupter_negative, generate_match_mask
 
+from timeout_decorator import timeout, TimeoutError
+
+@timeout(60*3)  # Set a timeout of n seconds for this function
 def generate_random_reward_batch(list_of_programs, 
                                  number_of_programs_to_sample, 
                                  tokenizer, 
