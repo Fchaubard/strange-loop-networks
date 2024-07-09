@@ -264,7 +264,7 @@ if __name__ == '__main__':
             total_loss += loss.item()
             
             # Calculate accuracy
-            per_sample_acc = ((outputs.argmax(dim=-1) == microbatch_output_ids_flat.long()).float().sum().item())
+            per_sample_acc = ((model_outputs_flat.argmax(dim=-1) == microbatch_output_ids_flat).float().sum().item())
             total_correct += per_sample_acc
             iterss +=1
             # message = {"per iter loss": loss.item(), "per iter acc": per_sample_acc, "batch_size":input_ids.size(0),"batch_seq_size":input_ids.size(1), "iterss":iterss}
@@ -281,7 +281,7 @@ if __name__ == '__main__':
             scheduler.step(total_loss)
             optimizer_left.zero_grad()
 
-            accuracy = total_correct / (input_ids.size(0) * input_ids.size(1))  # Per-token accuracy
+            accuracy = total_correct / (input_ids.size(0) * input_ids.size(1))  # Per-token accuracy.. TODO: This is actually just the last iter.. not the full macro_batch.. need to fix.. too lazy..
             message = {"left_BCE_loss": round(float(total_loss),2), "left_per_tok_acc": round(float(accuracy),2), "lr": optimizer_left.param_groups[0]['lr'], "norm_grad": round(float(normed_grad),2)}
 
             #wandb.log(message)
