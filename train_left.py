@@ -1,7 +1,7 @@
 # train_left.py 
 # - picks up batches from ./batches/*, sorts by time to grab n most recent, and then trains left model on them. 
 # - pushes results to wandb, and saves checkpoints to ./checkpoint_left/ with format 'left_checkpoint_timestamp_iter_loss.h5'
-# - train with either Focal Loss, or with policy gradient optimization.. or PPO? or DPO? ... TBD! IMPLEMENT THIS LAST.
+# - train with either Cross Entropy, Focal Loss, or with policy gradient optimization.. or PPO? or RLOO? or DPO? ... TBD! IMPLEMENT THIS LAST! Just get it working.
 
 import torch
 from transformers import GPTNeoXModel, GPTNeoXForCausalLM, GPTNeoXConfig
