@@ -260,10 +260,10 @@ if __name__ == '__main__':
             accuracy = total_correct / (input_ids.size(0) * input_ids.size(1))  # Per-token accuracy
             message = {"left_BCE_loss": round(float(total_loss),2), "left_per_tok_acc": round(float(accuracy),2), "lr": optimizer_left.param_groups[0]['lr'], "norm_grad": round(float(normed_grad),2)}
 
-            wandb.log(message)
+            #wandb.log(message)
             print(message)
         
-        iterr+=1
+        iterr += 1
         num_batches_since_last_checkpoint += 1
         
         if num_batches_since_last_checkpoint >= save_checkpoint_every_n_batches:
@@ -272,7 +272,6 @@ if __name__ == '__main__':
             checkpoint_filepath = os.path.join(left_model_directory, checkpoint_filename)
             torch.save({
                 'model_state_dict': current_left_model.state_dict(),
-                'reward_layer_state_dict': reward_layer.state_dict(),
                 'optimizer_state_dict': optimizer_left.state_dict(),
                 'loss': total_loss,
             }, checkpoint_filepath)
