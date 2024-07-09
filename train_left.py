@@ -175,24 +175,47 @@ if __name__ == '__main__':
         # get the inputs and outputs ready
         input_texts = [sample['input_text'] for sample in batch]
         reward_masks = [sample['reward_mask'] for sample in batch]
-        output_texts = [sample['true_answer'] for sample in batch]
-
-        maxx_input = max([len(sample['input_text']) for sample in batch])
-        maxx_output = max([len(sample['true_answer']) for sample in batch])
-        if (maxx_input+maxx_output) > 4000:
-           print("MAXXXX LENGTH IS SURPASSED SO SKIPPING, MAXX: " + str(maxx) )
+        true_answers = [sample['true_answer'] for sample in batch]
+        
+        output_texts = []
+        for input_text, true_answer in zip(input_texts,true_answers):
+          split_point = input_text.find("<left model>") 
+          if split_point==-1:
+            output_target = input_text + "<left model>" + true_answer
+          else:
+            split_point += len("<left model>")
+            output_target = input_text[:split_point] + " " + true_answer
+          output_texts.append(output_target)
+          
+        maxx_input = max([len(i) for i in input_texts])
+        maxx_output = max([len(o) for o in output_texts])
+        
+        max_ctx_len = 2000
+      
+        if (max(maxx_input,maxx_output) > max_ctx_len:
+           print("MAXXXX LENGTH IS SURPASSED SO SKIPPING, maxx_input:" + str(maxx_input) +  " maxx_output:" + str(maxx_output) )
            continue
 
-        inputs = tokenizer(input_texts, return_tensors='pt', padding=True, truncation=True)
-        outputs = tokenizer(output_texts, return_tensors='pt', padding=True, truncation=True)
         
-        input_ids = inputs['input_ids'].to(device)
-        output_ids = outputs['input_ids'].to(device)
+        inputs = tokenizer(input_texts, return_tensors='pt', padding='max_length', truncation=True, max_length=max_ctx_len, add_special_tokens=True) # TODO: MAKE SURE THIS INCLUDES BOS token
+        outputs = tokenizer(output_texts, return_tensors='pt', padding='max_length', truncation=True, max_length=max_ctx_len,  add_special_tokens=True) # TODO: MAKE SURE THIS DOES NOT! 
         
-        attention_mask = inputs['attention_mask'].to(device)
+        input_ids = inputs['input_ids'][:,:-1].to(device) # drop the last column
+        output_ids = outputs['input_ids'][:,1:].to(device) # shift one right 
+        attention_mask = torch.ones_like(input_ids)
+        #attention_mask = inputs['attention_mask'][:,:-1].to(device)
         
         reward_masks_tensors = [torch.tensor(mask) for mask in reward_masks]
-        reward_masks_tensors_padded = nn.utils.rnn.pad_sequence(reward_masks_tensors, batch_first=True, padding_value=0).to(device)
+        reward_masks_tensors_padded = nn.utils.rnn.pad_sequence(reward_masks_tensors, batch_first=True, padding_value=0)
+        
+        # Ensure the padded sequences have the desired length
+        reward_masks_tensors_padded = reward_masks_tensors_padded[:, :max_ctx_len]
+        if reward_masks_tensors_padded.size(1) < max_ctx_len:
+            padding = torch.zeros((reward_masks_tensors_padded.size(0), max_ctx_len - reward_masks_tensors_padded.size(1)))
+            reward_masks_tensors_padded = torch.cat([reward_masks_tensors_padded, padding], dim=1)
+              
+        reward_masks_tensors_padded = reward_masks_tensors_padded[:,:-1].to(device)
+        
         batch_size = input_ids.size(0)
 
         # Initialize loss for accumulation
@@ -210,7 +233,6 @@ if __name__ == '__main__':
             microbatch_attention_mask = attention_mask[start_idx:end_idx, :]
             microbatch_reward_masks = reward_masks_tensors_padded[start_idx:end_idx, :]
 
-            pdb.set_trace()
           
             # Forward pass through the left model
             model_outputs = forward_with_reward_input(current_left_model, 
@@ -222,7 +244,7 @@ if __name__ == '__main__':
                                                 baseline=reward_input_baseline)
 
             model_outputs = model_outputs['logits']
-            
+            pdb.set_trace()
             # Calculate binary cross-entropy loss for each token
             microbatch_output_ids_flat = microbatch_output_ids.view(-1).long()
             model_outputs_flat = model_outputs.view(-1, model_outputs.shape[-1])
