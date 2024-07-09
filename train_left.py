@@ -38,14 +38,13 @@ def forward_with_reward_input(current_left_model, input_ids, token_rewards, atte
   token_rewards = token_rewards.expand(-1, -1, embeddings.size(-1))
   modified_embeddings = embeddings + token_rewards
 
-  outputs = current_left_model(
+  logits = current_left_model(
     inputs_embeds=modified_embeddings,
     attention_mask=attention_mask,
     return_dict=return_dict
   ).logits
 
-  # (batch x seq x V) = (batch x seq x h) x (h x V)
-  logits = torch.matmul(outputs, current_left_model.get_output_embeddings().weight) #.embed_out(outputs.last_hidden_state)
+  # outputs = (batch x seq x V) (but unnormalized?)
 
   if not return_dict:
     return logits
@@ -84,7 +83,7 @@ if __name__ == '__main__':
     patience=200
     cooldown=200
 
-    max_microbatch_size = 20 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
+    max_microbatch_size = 5 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
 
     save_checkpoint_every_n_batches = 1000
 
@@ -130,7 +129,7 @@ if __name__ == '__main__':
         current_left_model.config.pad_token_id = tokenizer.pad_token_id
         # current_left_model.resize_token_embeddings(len(tokenizer))
         
-        optimizer_left = optim.AdamW(list(current_left_model.parameters())), lr=lr, betas=betas, weight_decay=weight_decay)
+        optimizer_left = optim.AdamW(list(current_left_model.parameters()), lr=lr, betas=betas, weight_decay=weight_decay)
         optimizer_left.load_state_dict(checkpoint['optimizer_state_dict'])
     else:
         # load from hf default
@@ -138,7 +137,7 @@ if __name__ == '__main__':
         current_left_model = AutoModelForCausalLM.from_pretrained(model_id)
         current_left_model.config.pad_token_id = tokenizer.pad_token_id
         current_left_model.resize_token_embeddings(len(tokenizer))
-        optimizer_left = optim.AdamW(list(current_left_model.parameters())), lr=lr, betas=betas,weight_decay=weight_decay)
+        optimizer_left = optim.AdamW(list(current_left_model.parameters()), lr=lr, betas=betas,weight_decay=weight_decay)
     
     current_left_model = current_left_model.to(device)
     scheduler = ReduceLROnPlateau(optimizer_left, mode='min', factor=factor, patience=patience, cooldown=cooldown, threshold=0.0001, threshold_mode='rel',  min_lr=1e-9, eps=1e-08, verbose=True)
@@ -188,7 +187,7 @@ if __name__ == '__main__':
         outputs = tokenizer(output_texts, return_tensors='pt', padding=True, truncation=True)
         
         input_ids = inputs['input_ids'].to(device)
-        output_ids = output['input_ids'].to(device)
+        output_ids = outputs['input_ids'].to(device)
         
         attention_mask = inputs['attention_mask'].to(device)
         
@@ -220,11 +219,14 @@ if __name__ == '__main__':
                                                 attention_mask=microbatch_attention_mask, 
                                                 return_dict=True, 
                                                 alpha=reward_input_alpha, 
-                                                baseline=reward_input_baseline).logits
+                                                baseline=reward_input_baseline)
+
+            model_outputs = model_outputs['logits']
             
             # Calculate binary cross-entropy loss for each token
             microbatch_output_ids_flat = microbatch_output_ids.view(-1).long()
-            model_outputs_flat = model_outputs.view(-1, 2)  # Flatten the outputs
+            model_outputs_flat = model_outputs.view(-1, model_outputs.shape[-1])
+            #model_outputs_flat = model_outputs.view(-1, 2)  # Flatten the outputs
 
             loss_fn = nn.CrossEntropyLoss()
             loss = loss_fn(model_outputs_flat, microbatch_output_ids_flat.long())
