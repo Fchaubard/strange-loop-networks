@@ -192,7 +192,7 @@ if __name__ == '__main__':
         
         max_ctx_len = 2000
       
-        if (max(maxx_input,maxx_output) > max_ctx_len:
+        if max(maxx_input,maxx_output) > max_ctx_len:
            print("MAXXXX LENGTH IS SURPASSED SO SKIPPING, maxx_input:" + str(maxx_input) +  " maxx_output:" + str(maxx_output) )
            continue
 
