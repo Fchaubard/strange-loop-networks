@@ -63,13 +63,14 @@ if __name__ == '__main__':
     device = 'cuda:0'#'cpu'#
 
     # update what model you want to use WARNING: IF YOU WANT TO START FROM A CHECKPOINT OF LEFT MODEL, THIS IS THE PLACE TO DO IT:
-    model_id = "EleutherAI/pythia-410M" #"EleutherAI/pythia-1b" # "EleutherAI/pythia-70m-v0"
+    model_id = "EleutherAI/pythia-410M" #"EleutherAI/pythia-1b" #"EleutherAI/pythia-70m-v0"
     left_model_checkpoint_name = None # use this if you want to load from a checkpoint, else will load from pythia pretrained
     
     left_model_directory = "./left_checkpoints/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
     
     macro_batch_size = 1 
     pad_tok = '[PAD]'
+    left_model_tok = '<left model>'
 
     # Initialize wandb
     wandb_project_name = "left_training_pythia_"+model_id.replace("/","_")
@@ -83,8 +84,9 @@ if __name__ == '__main__':
     patience=200
     cooldown=200
 
-    max_microbatch_size = 5 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
-
+    max_microbatch_size = 20 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
+    max_ctx_len = 2000 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
+  
     save_checkpoint_every_n_batches = 1000
 
     # for handling the reward input signal
@@ -95,7 +97,7 @@ if __name__ == '__main__':
     #------------------
     # DO SETUP:
     #------------------
-    #wandb.init(project=wandb_project_name)
+    wandb.init(project=wandb_project_name)
 
     # Check if the batches_directory exists
     if not os.path.exists(batches_directory):
@@ -179,18 +181,18 @@ if __name__ == '__main__':
         
         output_texts = []
         for input_text, true_answer in zip(input_texts,true_answers):
-          split_point = input_text.find("<left model>") 
+          split_point = input_text.find(left_model_tok) 
           if split_point==-1:
-            output_target = input_text + "<left model>" + true_answer
+            output_target = input_text + left_model_tok + true_answer
           else:
-            split_point += len("<left model>")
-            output_target = input_text[:split_point] + " " + true_answer
+            split_point += len(left_model_tok)
+            output_target = input_text[:split_point] + "" + true_answer
           output_texts.append(output_target)
           
         maxx_input = max([len(i) for i in input_texts])
         maxx_output = max([len(o) for o in output_texts])
         
-        max_ctx_len = 2000
+        
       
         if max(maxx_input,maxx_output) > max_ctx_len:
            print("MAXXXX LENGTH IS SURPASSED SO SKIPPING, maxx_input:" + str(maxx_input) +  " maxx_output:" + str(maxx_output) )
@@ -244,7 +246,7 @@ if __name__ == '__main__':
                                                 baseline=reward_input_baseline)
 
             model_outputs = model_outputs['logits']
-            pdb.set_trace()
+            #pdb.set_trace()
             # Calculate binary cross-entropy loss for each token
             microbatch_output_ids_flat = microbatch_output_ids.view(-1).long()
             model_outputs_flat = model_outputs.view(-1, model_outputs.shape[-1])
@@ -284,7 +286,7 @@ if __name__ == '__main__':
             accuracy = total_correct / (input_ids.size(0) * input_ids.size(1))  # Per-token accuracy.. TODO: This is actually just the last iter.. not the full macro_batch.. need to fix.. too lazy..
             message = {"left_BCE_loss": round(float(total_loss),2), "left_per_tok_acc": round(float(accuracy),2), "lr": optimizer_left.param_groups[0]['lr'], "norm_grad": round(float(normed_grad),2)}
 
-            #wandb.log(message)
+            wandb.log(message)
             print(message)
         
         iterr += 1
