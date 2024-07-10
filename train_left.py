@@ -84,21 +84,19 @@ if __name__ == '__main__':
     patience=200
     cooldown=200
 
-    max_microbatch_size = 20 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
+    max_microbatch_size = 3 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
     max_ctx_len = 2000 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
   
-    save_checkpoint_every_n_batches = 1000
+    save_checkpoint_every_n_batches = 100
 
     # for handling the reward input signal
     reward_input_baseline = 0.5
     reward_input_alpha = 2.
      
-    
     #------------------
     # DO SETUP:
     #------------------
     wandb.init(project=wandb_project_name)
-
     # Check if the batches_directory exists
     if not os.path.exists(batches_directory):
         # If the directory does not exist, create it
@@ -188,11 +186,12 @@ if __name__ == '__main__':
             split_point += len(left_model_tok)
             output_target = input_text[:split_point] + "" + true_answer
           output_texts.append(output_target)
-          
+        
+
         maxx_input = max([len(i) for i in input_texts])
         maxx_output = max([len(o) for o in output_texts])
         
-        
+        print('training:'+str(iterr)) 
       
         if max(maxx_input,maxx_output) > max_ctx_len:
            print("MAXXXX LENGTH IS SURPASSED SO SKIPPING, maxx_input:" + str(maxx_input) +  " maxx_output:" + str(maxx_output) )
@@ -202,8 +201,8 @@ if __name__ == '__main__':
         inputs = tokenizer(input_texts, return_tensors='pt', padding='max_length', truncation=True, max_length=max_ctx_len, add_special_tokens=True) # TODO: MAKE SURE THIS INCLUDES BOS token
         outputs = tokenizer(output_texts, return_tensors='pt', padding='max_length', truncation=True, max_length=max_ctx_len,  add_special_tokens=True) # TODO: MAKE SURE THIS DOES NOT! 
         
-        input_ids = inputs['input_ids'][:,:-1].to(device) # drop the last column
-        output_ids = outputs['input_ids'][:,1:].to(device) # shift one right 
+        input_ids = inputs['input_ids'][:,:-1] #.to(device) # drop the last column
+        output_ids = outputs['input_ids'][:,1:] #.to(device) # shift one right 
         attention_mask = torch.ones_like(input_ids)
         #attention_mask = inputs['attention_mask'][:,:-1].to(device)
         
@@ -216,7 +215,7 @@ if __name__ == '__main__':
             padding = torch.zeros((reward_masks_tensors_padded.size(0), max_ctx_len - reward_masks_tensors_padded.size(1)))
             reward_masks_tensors_padded = torch.cat([reward_masks_tensors_padded, padding], dim=1)
               
-        reward_masks_tensors_padded = reward_masks_tensors_padded[:,:-1].to(device)
+        reward_masks_tensors_padded = reward_masks_tensors_padded[:,:-1] #.to(device)
         
         batch_size = input_ids.size(0)
 
@@ -230,10 +229,10 @@ if __name__ == '__main__':
             start_idx = i * max_microbatch_size
             end_idx = min(start_idx + max_microbatch_size, batch_size)
             
-            microbatch_input_ids = input_ids[start_idx:end_idx, :]
-            microbatch_output_ids = output_ids[start_idx:end_idx, :]
-            microbatch_attention_mask = attention_mask[start_idx:end_idx, :]
-            microbatch_reward_masks = reward_masks_tensors_padded[start_idx:end_idx, :]
+            microbatch_input_ids = input_ids[start_idx:end_idx, :].to(device)
+            microbatch_output_ids = output_ids[start_idx:end_idx, :].to(device)
+            microbatch_attention_mask = attention_mask[start_idx:end_idx, :].to(device)
+            microbatch_reward_masks = reward_masks_tensors_padded[start_idx:end_idx, :].to(device)
 
           
             # Forward pass through the left model
