@@ -24,7 +24,7 @@ from torchvision.ops import sigmoid_focal_loss
 import wandb
 import os
 
-os.environ["WANDB_API_KEY"] = "cce47709d839921f0b13533529f31c8af7f3f4dc"
+os.environ["WANDB_API_KEY"] = ""
 
 
 if __name__ == '__main__':
