@@ -2,7 +2,7 @@
 # - creates batches in a while True loop, with positive / negative pairs and puts them in ./batches/ folder for train loops to pick up
 # - if ./batches/ doesnt exist, create it. If it does exist, add more to it.
 # - format: batch_timestamp_<left_model_checkpoint_name>.pckl
-# -         ({'input_text':input_text, 'true_answer':true_answer, 'reward_mask':reward_mask})
+# -         ({'input_text':input_text, 'true_answer':true_answer, 'valence_mask':valence_mask})
 # - will need to pickup most recent (best performing) left_model from checkpoint every once in a while.
 import os
 import sys
@@ -20,7 +20,7 @@ from text_corrupter import text_corrupter_negative, generate_match_mask
 from timeout_decorator import timeout, TimeoutError
 
 @timeout(60*3)  # Set a timeout of n seconds for this function
-def generate_random_reward_batch(list_of_programs, 
+def generate_random_valence_batch(list_of_programs, 
                                  number_of_programs_to_sample, 
                                  tokenizer, 
                                  base_model, 
@@ -44,7 +44,7 @@ def generate_random_reward_batch(list_of_programs,
     # NEGS: Input - <left model> - Left Model Output 
     #     Then try the left model on each question, and see what it outputs. Append that to the example input of the model
     #     Input = question + “<left model>” + T0 from left model
-    #     reward = [0,0,0,0,0,0,0] (unless T0 from left is correct at all, then reward = generate_match_mask(left model answer,true answer))
+    #     valence = [0,0,0,0,0,0,0] (unless T0 from left is correct at all, then valence = generate_match_mask(left model answer,true answer))
     # return batch = list of (input='blah blah',targets='[0,1,0,1,0,0,0,1,1,1 ... ]') with length b/2 of positives + b/2 of negatives
 
     if samples_per_program < 2 or samples_per_program%2!=0:
@@ -73,9 +73,9 @@ def generate_random_reward_batch(list_of_programs,
                     true_answer = positive_sample['answer']
 
                     input_text = question + " "+left_model_sep_tok+" " + true_answer
-                    reward_mask = [1 for _ in range(len(tokenizer.tokenize(input_text)))]
+                    valence_mask = [1 for _ in range(len(tokenizer.tokenize(input_text)))]
 
-                    batch.append({'input_text':input_text, 'true_answer':true_answer, 'reward_mask':reward_mask})
+                    batch.append({'input_text':input_text, 'true_answer':true_answer, 'valence_mask':valence_mask})
 
                 # Gen Negatives w/ left_model: for first half of positive samples, 
                 # generate left_model_samples by calling model.generate(positive_sample.question) 
@@ -104,12 +104,12 @@ def generate_random_reward_batch(list_of_programs,
                         left_model_answers = generated_texts[j] #left_model_answers
                         input_text = sample['question'] + " "+left_model_sep_tok+" " + left_model_answers
                         # print("model_outputted negative example:" + input_text)
-                        reward_mask = generate_match_mask(
+                        valence_mask = generate_match_mask(
                                                             tokenizer, 
                                                             sample['question'] + " "+left_model_sep_tok+" " +sample['answer'], 
                                                             sample['question'] + " "+left_model_sep_tok+" " +left_model_answers
                                                          )
-                        batch.append({'input_text':input_text, 'true_answer':sample['answer'], 'reward_mask':reward_mask})
+                        batch.append({'input_text':input_text, 'true_answer':sample['answer'], 'valence_mask':valence_mask})
 
                 # Gen Negatives w/ sentence augs: for first half of positive samples, generate text_corrupted_samples via text_corrupter_negative()
                 # with targets = generate_match_mask(true answer, string_corrupted) 
@@ -121,13 +121,13 @@ def generate_random_reward_batch(list_of_programs,
                     for _ in range(num_corruptions):
                         corrupted_answer = text_corrupter_negative(corrupted_answer)
                     input_text = question + " "+left_model_sep_tok+" " + corrupted_answer
-                    reward_mask = generate_match_mask(tokenizer, true_answer, corrupted_answer)
-                    reward_mask = generate_match_mask(
+                    valence_mask = generate_match_mask(tokenizer, true_answer, corrupted_answer)
+                    valence_mask = generate_match_mask(
                                     tokenizer, 
                                     sample['question'] + " "+left_model_sep_tok+" " +true_answer, 
                                     sample['question'] + " "+left_model_sep_tok+" " +corrupted_answer
                                  )
-                    batch.append({'input_text':input_text, 'true_answer':true_answer, 'reward_mask':reward_mask})
+                    batch.append({'input_text':input_text, 'true_answer':true_answer, 'valence_mask':valence_mask})
                     
                 sampled_programs.append(program)
             except Exception as e:
@@ -197,7 +197,7 @@ if __name__ == '__main__':
     list_of_programs = [program.strip() for program in list_of_programs]
     print('# programs: '+str(len(list_of_programs)))
 
-    # Step 3: grab a tokenizer for reward_mask creation
+    # Step 3: grab a tokenizer for valence_mask creation
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     
     # create initial model 
@@ -218,7 +218,7 @@ if __name__ == '__main__':
     # Step 4: create some batches and save them off
     while True:
         # Create the batch:
-        batch = generate_random_reward_batch(list_of_programs, 
+        batch = generate_random_valence_batch(list_of_programs, 
                                              number_of_programs_to_sample, 
                                              tokenizer, 
                                              current_left_model, 
@@ -243,12 +243,12 @@ if __name__ == '__main__':
             dd = random.choice(batch)
             input_text =  dd['input_text']
             true_answer =  dd['true_answer']
-            reward_mask =  dd['reward_mask']
+            valence_mask =  dd['valence_mask']
             print('='*50)
             print("Randomly sampling to show you whats being produced:")
             print(f"input_text: {input_text}")
             print(f"true_answer: {true_answer}")
-            print(f"reward_mask: {reward_mask}")
+            print(f"valence_mask: {valence_mask}")
             print('batches_created_since_last_model_update: '+str(batches_created_since_last_model_update))
             print('='*50)
 
