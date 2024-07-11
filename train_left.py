@@ -25,7 +25,7 @@ from torchvision.ops import sigmoid_focal_loss
 import wandb
 import os
 
-os.environ["WANDB_API_KEY"] = "cce47709d839921f0b13533529f31c8af7f3f4dc"
+os.environ["WANDB_API_KEY"] = ""
 
 
 def forward_with_reward_input(current_left_model, input_ids, token_rewards, attention_mask=None, return_dict=True, alpha=1.,baseline=0.5):
