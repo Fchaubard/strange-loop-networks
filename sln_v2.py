@@ -63,31 +63,31 @@ class SLN:
         self.current_left_model.load_state_dict(checkpoint['model_state_dict'])
         print("consciousness booted! Give me a prompt:")
 
-    def _forward_right(self, input_texts):
-        inputs = self.tokenizer(input_texts, return_tensors='pt', padding=True, truncation=True)
-        input_ids = inputs['input_ids'].to(self.right_model_device)
-        attention_mask = inputs['attention_mask'].to(self.right_model_device)
-
+    def _forward_right(self, input_ids, attention_mask):
+        input_ids = input_ids.to(self.right_model_device)
+        attention_mask = attention_mask.to(self.right_model_device)
         logits = self.current_right_model(input_ids, attention_mask=attention_mask, return_dict=True).logits
         outputs = self.valence_layer(logits) # which is batch x seq x 2
         valence_mask = torch.round(softmax(outputs, dim=-1))[0,:,1]
         return valence_mask
 
-    def _forward_left(self, input_texts, input_valence, attention_mask):
-        inputs = self.tokenizer(input_texts, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_ctx_len, add_special_tokens=True)
-        input_ids = inputs['input_ids'].to(self.left_model_device)
-        valence_masks_tensors_padded = nn.utils.rnn.pad_sequence([input_valence], batch_first=True, padding_value=0)
+    def _forward_left(self, input_ids, input_valence, attention_mask):
+        input_ids = input_ids.to(self.left_model_device)
+        attention_mask = attention_mask.to(self.left_model_device)
+        
+        # valence_masks_tensors_padded = nn.utils.rnn.pad_sequence([input_valence], batch_first=True, padding_value=0)
 
         # Ensure the padded sequences have the desired length
-        valence_masks_tensors_padded = valence_masks_tensors_padded[:, :self.max_ctx_len]
-        if valence_masks_tensors_padded.size(1) < self.max_ctx_len:
-            padding = torch.zeros((valence_masks_tensors_padded.size(0), self.max_ctx_len - valence_masks_tensors_padded.size(1))).to(self.left_model_device)
-            valence_masks_tensors_padded = torch.cat([valence_masks_tensors_padded, padding], dim=1)
+        # valence_masks_tensors_padded = valence_masks_tensors_padded[:, :self.max_ctx_len]
+        # if valence_masks_tensors_padded.size(1) < self.max_ctx_len:
+        #     padding = torch.zeros((valence_masks_tensors_padded.size(0), self.max_ctx_len - valence_masks_tensors_padded.size(1))).to(self.left_model_device)
+        #     valence_masks_tensors_padded = torch.cat([valence_masks_tensors_padded, padding], dim=1)
         
         model_outputs = self._forward_left_with_valence_input(
             self.current_left_model,
             input_ids,
-            valence_masks_tensors_padded,
+            #valence_masks_tensors_padded,
+            input_valance,
             attention_mask=attention_mask,
             return_dict=True,
             alpha=self.valence_input_alpha,
@@ -97,11 +97,13 @@ class SLN:
         model_outputs = model_outputs['logits']
         
         # Sample from the model outputs to produce text
-        generated_tokens = torch.argmax(model_outputs, dim=-1)
+        generated_tokens = torch.argmax(model_outputs, dim=-1) # TODO: greedy sampling?? or be smarter..
+        
         self.last_left_model_response = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+        
         response_parts = self.last_left_model_response.split(self.model_tok)
         if len(response_parts) > 1:
-            self.last_left_model_response = response_parts[1]
+            self.last_left_model_response = response_parts[-1]
         else:
             raise ValueError(f"The response does not contain the model token: {self.model_tok}")
         
@@ -179,13 +181,17 @@ class SLN:
             print(f"IDL count {self.IDL_count}: total_valence: {sum(self.last_valence_mask_subset)} IDL: {self.last_left_model_response}")
             input_text = prompt_text + self.model_tok + self.last_left_model_response
             #input_text = input_text + (self.pad_tok * (self.max_ctx_len - len(input_text)))
+            inputs = self.tokenizer(input_texts, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_ctx_len, add_special_tokens=True)
+            
+            input_ids = inputs['input_ids']
+            attention_mask=torch.ones_like(input_ids)
 
             # Forward pass right model
-            self.last_valence_mask = self._forward_right(input_text)
-            self.last_valence_mask_subset = [i for i, token in enumerate(input_text.split()) if token == self.last_left_model_response]
+            self.last_valence_mask = self._forward_right(input_ids, attention_mask)
+            # self.last_valence_mask_subset = [i for i, token in enumerate(input_text.split()) if token == self.last_left_model_response]
 
             # Forward pass left model
-            self.last_left_model_response = self._forward_left(input_text, self.last_valence_mask, attention_mask=torch.ones_like(input_tokens.input_ids).to(self.left_model_device))
+            self.last_left_model_response = self._forward_left(input_ids, self.last_valence_mask, attention_mask).to("cpu"))
             
             pdb.set_trace()
 
