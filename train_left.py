@@ -124,11 +124,12 @@ if __name__ == '__main__':
         print("LOADING MODEL FROM: " +left_model_checkpoint_name)
         # Implement load from a checkpoint
         checkpoint = torch.load(left_model_checkpoint_name)
-        current_left_model = AutoModelForCausalLM.from_pretrained(model_id)
-        current_left_model.load_state_dict(checkpoint['model_state_dict'])
+        current_left_model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
+
         current_left_model.config.pad_token_id = tokenizer.pad_token_id
-        # current_left_model.resize_token_embeddings(len(tokenizer))
-        
+        current_left_model.resize_token_embeddings(len(tokenizer))
+        current_left_model.load_state_dict(checkpoint['model_state_dict'])
+
         optimizer_left = optim.AdamW(list(current_left_model.parameters()), lr=lr, betas=betas, weight_decay=weight_decay)
         optimizer_left.load_state_dict(checkpoint['optimizer_state_dict'])
     else:
