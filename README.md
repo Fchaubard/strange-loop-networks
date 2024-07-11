@@ -2,9 +2,13 @@ Francois' SLN research:
 
 The goal of this research is to test if SLNs can generalize better on the same train data.
 - CustomModel_Francois.py (in lm_eval for generating results)
-- train_sft.py (train code for sft)
-- train_sln.py (train code for SLN)
-- sln.py (SLN class definition)
+- train_right.py (train code for the right lobe.. valence model)
+- train_left.py (train code for the left lobe.. trajectory model)
+- batch_generator.py (create a bunch of batches to be pulled by both train_left and train_right)
+- sln_v2.py (once you have 2 checkpoints you like (left/right) then you can boot up consciousness and test it out!)
+- (depr) train_sft.py (train code for sft)
+- (depr) train_sln.py (train code for SLN)
+- (depr) sln_v1.py (SLN class definition)
 - (be sure to 'git clone https://github.com/Fchaubard/sentence_augs.git')
 
 # Step 1:
