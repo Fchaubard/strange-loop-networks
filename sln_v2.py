@@ -74,6 +74,7 @@ class SLN:
     def _forward_left(self, input_ids, input_valence, attention_mask):
         input_ids = input_ids.to(self.left_model_device)
         attention_mask = attention_mask.to(self.left_model_device)
+        input_valence = input_valence.to(self.left_model_device)
         
         # valence_masks_tensors_padded = nn.utils.rnn.pad_sequence([input_valence], batch_first=True, padding_value=0)
 
@@ -94,20 +95,10 @@ class SLN:
             baseline=self.valence_input_baseline
         )
 
-        model_outputs = model_outputs['logits']
-        
-        # Sample from the model outputs to produce text
+        model_outputs = model_outputs['logits']  
         generated_tokens = torch.argmax(model_outputs, dim=-1) # TODO: greedy sampling?? or be smarter..
         
-        self.last_left_model_response = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-        
-        response_parts = self.last_left_model_response.split(self.model_tok)
-        if len(response_parts) > 1:
-            self.last_left_model_response = response_parts[-1]
-        else:
-            raise ValueError(f"The response does not contain the model token: {self.model_tok}")
-        
-        return self.last_left_model_response
+        return generated_tokens
 
     def _forward_left_with_valence_input(self, 
                                         current_left_model, 
@@ -142,24 +133,25 @@ class SLN:
         else:
             return True #continue with IDL
 
-        if sum(self.last_valence_mask_subset) == len(self.last_valence_mask):
-            return False #break out of IDL
-        return True #continue with IDL
+        if sum(self.valence_subset) >= 0.95 * len(self.valence_subset): # meaning mostly 1s valence in the left response. 
+            return False #we got a good answer! Break out of IDL! 
+        return True #continue with IDL.. not there yet.. 
+        
     def _decode(self, output_tokens):
         txt = self.tokenizer.decode(output_tokens.cpu().numpy()[0], skip_special_tokens=True)
         return txt 
         
 
     def forward(self, prompt_text):
-        input_tokens = self.tokenizer(prompt_text, return_tensors="pt", padding=True, truncation=True)
+        self.prompt_tokens = self.tokenizer(prompt_text + self.model_tok, return_tensors="pt", padding=True, truncation=True)
         
         pdb.set_trace()
         
         print('generating Type 1 response:')
 
-        output_tokens = self.current_left_model.generate(
-            input_tokens.input_ids.to(self.left_model_device),
-            attention_mask=input_tokens.attention_mask.to(self.left_model_device),
+        self.output_tokens = self.current_left_model.generate(
+            self.prompt_tokens.input_ids.to(self.left_model_device),
+            attention_mask=self.prompt_tokens.attention_mask.to(self.left_model_device),
             max_new_tokens= 100, #self.max_ctx_len - len(prompt_text),
             #max_length=self.max_ctx_len/2,  # Maximum length of the sequence
             eos_token_id=self.tokenizer.eos_token_id,  # Stop when the end-of-sequence token is generated
@@ -167,6 +159,8 @@ class SLN:
             early_stopping=True,  # Stop early when the beams are sufficiently similar
             pad_token_id=self.tokenizer.pad_token_id
         )
+
+        num_generated_tokens = self.output_tokens.shape[1] - self.prompt_tokens.input_ids[1]
         
         self.last_left_model_response = self._decode(output_tokens) #self.tokenizer.decode(self.last_left_model_response.cpu().numpy()[0], skip_special_tokens=True)
         self.last_left_model_response = self.last_left_model_response.split(self.model_tok)[-1]
@@ -179,23 +173,37 @@ class SLN:
         pdb.set_trace()
         print('Now doing Type 2 thinking to really think about it...')
         while self._stopping_criteria():
-            print(f"IDL count {self.IDL_count}: total_valence: {sum(self.last_valence_mask)} IDL: {self.last_left_model_response}")
-            input_text = prompt_text + self.model_tok + self.last_left_model_response
+            # input_text = prompt_text + self.model_tok + self.last_left_model_response
             #input_text = input_text + (self.pad_tok * (self.max_ctx_len - len(input_text)))
-            inputs = self.tokenizer(input_texts, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_ctx_len, add_special_tokens=True)
+            # inputs = self.tokenizer(input_text, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_ctx_len, add_special_tokens=True)
             
-            input_ids = inputs['input_ids']
-            attention_mask=torch.ones_like(input_ids)
+            # input_ids = inputs['input_ids']
+            attention_mask=torch.ones_like(self.output_tokens)
 
             # Forward pass right model
-            self.last_valence_mask = self._forward_right(input_ids, attention_mask)
-            # self.last_valence_mask_subset = [i for i, token in enumerate(input_text.split()) if token == self.last_left_model_response]
+            self.last_valence_mask = self._forward_right(self.output_tokens, attention_mask)
 
-            # Forward pass left model
-            self.last_left_model_response = self._forward_left(input_ids, self.last_valence_mask, attention_mask).to("cpu"))
+            self.valence_subset = self.last_valence_mask[num_generated_tokens:] # take only the valence for the generated tokens
             
+            print(f"IDL count {self.IDL_count}: total_valence: {sum(self.valence_subset)} IDL: {self.last_left_model_response}")
+
             pdb.set_trace()
 
+            # Forward pass left model and update our output_tokens with the new valence scores
+            self.output_tokens = self._forward_left(self.output_tokens, self.last_valence_mask, attention_mask).to("cpu")
+
+            #TODO: CHECK IF WE HAVE TO REMOVE [0] or not.
+            
+            self.last_left_model_response = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+            
+            response_parts = self.last_left_model_response.split(self.model_tok)
+            if len(response_parts) > 1:
+                self.last_left_model_response = response_parts[-1]
+            else:
+                raise ValueError(f"The response does not contain the model token: {self.model_tok}")
+        
+            pdb.set_trace()
+            
             self.IDL_count += 1
         return self.last_left_model_response
 
