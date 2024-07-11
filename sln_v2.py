@@ -7,7 +7,7 @@ import pdb
 
 class SLN:
     def __init__(self, right_model_checkpoint_name, left_model_checkpoint_name):
-        
+      with torch.no_grad():  
         self.right_model_checkpoint_name = right_model_checkpoint_name
         self.left_model_checkpoint_name = left_model_checkpoint_name
         
@@ -33,9 +33,9 @@ class SLN:
         print("LOADING RIGHT MODEL FROM: " + self.right_model_checkpoint_name)
         checkpoint = torch.load(self.right_model_checkpoint_name)
         self.current_right_model = AutoModelForCausalLM.from_pretrained(self.base_model_id).to(self.right_model_device)
-        self.current_right_model.load_state_dict(checkpoint['model_state_dict'])
         self.current_right_model.config.pad_token_id = self.tokenizer.pad_token_id
         self.current_right_model.resize_token_embeddings(len(self.tokenizer))
+        self.current_right_model.load_state_dict(checkpoint['model_state_dict'])
 
         vocab_size = self.current_right_model.config.vocab_size
         self.valence_layer = nn.Sequential(
@@ -43,8 +43,14 @@ class SLN:
             nn.Linear(vocab_size, 2),
             nn.Softmax(dim=-1)
         ).to(self.right_model_device)
-        self.valence_layer.load_state_dict(checkpoint['valence_layer_state_dict'])
-
+        try:
+          self.valence_layer.load_state_dict(checkpoint['valence_layer_state_dict'])
+        except Exception as e:
+            try:
+                self.valence_layer.load_state_dict(checkpoint['reward_layer_state_dict'])
+            except Exception as e:
+                print("could not load valence_layer_state_dict or reward_layer_state_dict in right model: " + str(e))
+                exit()
         # Initialize left model
         if not self.left_model_checkpoint_name:
             raise ValueError("Left model checkpoint name must be provided")
@@ -60,9 +66,11 @@ class SLN:
     def _forward_right(self, input_texts):
         inputs = self.tokenizer(input_texts, return_tensors='pt', padding=True, truncation=True)
         input_ids = inputs['input_ids'].to(self.right_model_device)
-        logits = self.current_right_model(input_ids, return_dict=True).logits
-        outputs = self.valence_layer(logits) # which is seq x 2
-        valence_mask = torch.round(softmax(outputs, dim=-1))[:,1]
+        attention_mask = inputs['attention_mask'].to(self.right_model_device)
+
+        logits = self.current_right_model(input_ids, attention_mask=attention_mask, return_dict=True).logits
+        outputs = self.valence_layer(logits) # which is batch x seq x 2
+        valence_mask = torch.round(softmax(outputs, dim=-1))[0,:,1]
         return valence_mask
 
     def _forward_left(self, input_texts, input_valence, attention_mask):
@@ -127,32 +135,50 @@ class SLN:
 
     def _stopping_criteria(self):
         if self.IDL_count > self.IDL_limit:
-            self.last_left_model_response = "I do not know"
-            return False
+            self.last_left_model_response = "I do not know.. I am not smart enough yet!"
+            return False #break out of IDL
         else:
-            self.IDL_count += 1
-            return True
+            return True #continue with IDL
 
         if sum(self.last_valence_mask_subset) == len(self.last_valence_mask):
-            return False
+            return False #break out of IDL
+        return True #continue with IDL
+    def _decode(self, output_tokens):
+        txt = self.tokenizer.decode(output_tokens.cpu().numpy()[0], skip_special_tokens=True)
+        return txt 
+        
 
     def forward(self, prompt_text):
         input_tokens = self.tokenizer(prompt_text, return_tensors="pt", padding=True, truncation=True)
         
-        self.last_left_model_response = self.current_left_model.generate(
+        pdb.set_trace()
+        
+        print('generating Type 1 response:')
+
+        output_tokens = self.current_left_model.generate(
             input_tokens.input_ids.to(self.left_model_device),
             attention_mask=input_tokens.attention_mask.to(self.left_model_device),
-            max_new_tokens=self.max_ctx_len - len(prompt_text),
+            max_new_tokens= 100, #self.max_ctx_len - len(prompt_text),
+            #max_length=self.max_ctx_len/2,  # Maximum length of the sequence
+            eos_token_id=self.tokenizer.eos_token_id,  # Stop when the end-of-sequence token is generated
+            num_beams=5,  # Use beam search with 5 beams
+            early_stopping=True,  # Stop early when the beams are sufficiently similar
             pad_token_id=self.tokenizer.pad_token_id
         )
         
+        self.last_left_model_response = self._decode(output_tokens) #self.tokenizer.decode(self.last_left_model_response.cpu().numpy()[0], skip_special_tokens=True)
+        self.last_left_model_response = self.last_left_model_response.split(self.model_tok)[-1]
+
         self.last_valence_mask_subset = []
         self.IDL_count = 0
         self.IDL_limit = 10  # This should be set according to your needs
         
-        while not self._stopping_criteria():
+        pdb.set_trace()
+        print('Now doing Type 2 thinking to really think about it...')
+        while self._stopping_criteria():
+            print(f"IDL count {self.IDL_count}: total_valence: {sum(self.last_valence_mask_subset)} IDL: {self.last_left_model_response}")
             input_text = prompt_text + self.model_tok + self.last_left_model_response
-            input_text = input_text + (self.pad_tok * (self.max_ctx_len - len(input_text)))
+            #input_text = input_text + (self.pad_tok * (self.max_ctx_len - len(input_text)))
 
             # Forward pass right model
             self.last_valence_mask = self._forward_right(input_text)
@@ -160,15 +186,18 @@ class SLN:
 
             # Forward pass left model
             self.last_left_model_response = self._forward_left(input_text, self.last_valence_mask, attention_mask=torch.ones_like(input_tokens.input_ids).to(self.left_model_device))
-        
+            
+            pdb.set_trace()
+
+            self.IDL_count += 1
         return self.last_left_model_response
 
 
 if __name__ == "__main__":
     print("Booting consciousness... one sec.. :)")
     
-    right_model_checkpoint = "left_checkpoint_20240711093303_iter_100_loss_55.50.pth" #"<path to right model checkpoint>"
-    left_model_checkpoint = "right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" #"<path to left model checkpoint>"
+    left_model_checkpoint = "/root/left_checkpoint_20240711093303_iter_100_loss_55.50.pth" #"<path to right model checkpoint>"
+    right_model_checkpoint = "/root/right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" #"<path to left model checkpoint>"
     
     sln = SLN(right_model_checkpoint, left_model_checkpoint)
   
