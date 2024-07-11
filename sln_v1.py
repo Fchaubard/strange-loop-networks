@@ -34,7 +34,7 @@ class StrangeLoopNetwork(nn.Module):
         self.right_model = deepcopy(base_model)
         self.tokenizer = tokenizer
 
-        # Define the reward layer
+        # Define the valence layer
         vocab_size = base_model.config.vocab_size
         
         self.left_model_device=0
@@ -43,7 +43,7 @@ class StrangeLoopNetwork(nn.Module):
         self.left_model.to(f'cuda:{self.left_model_device}')
         self.right_model.to(f'cuda:{self.right_model_device}')
         
-        self.reward_layer = nn.Sequential(
+        self.valence_layer = nn.Sequential(
             nn.LayerNorm(vocab_size, base_model.config.layer_norm_eps),
             nn.Linear(vocab_size, 2),
             nn.Softmax(dim=-1)
@@ -55,14 +55,14 @@ class StrangeLoopNetwork(nn.Module):
         self.IDL_stopping_probability_thresh = IDL_stopping_probability_thresh
         self.max_internal_seq_length = max_internal_seq_length
         
-        self.baseline_score = baseline_score # to offset reward [0-1] for classificaiton (i.e. 0.5 so reward is -0.5 to 0.5)
+        self.baseline_score = baseline_score # to offset valence [0-1] for classificaiton (i.e. 0.5 so valence is -0.5 to 0.5)
         self.max_grad_norm = max_grad_norm # for clip loss
         self.epsilon = epsilon # for clip loss
         self.max_microbatch_size = max_microbatch_size # to make sure we do not run out of memory
         
         if training_mode:
             self.optimizer_left = optim.AdamW(self.left_model.parameters(), lr=lr)
-            self.optimizer_right = optim.AdamW(list(self.right_model.parameters()) + list(self.reward_layer.parameters()), lr=lr) 
+            self.optimizer_right = optim.AdamW(list(self.right_model.parameters()) + list(self.valence_layer.parameters()), lr=lr) 
             self.left_model.train()
             self.right_model.train()
             
@@ -106,13 +106,13 @@ class StrangeLoopNetwork(nn.Module):
             
             outputs_right = self.right_model(x_right.to(f'cuda:{self.right_model_device}'), return_dict=True)
             
-            y_hat_right = self.reward_layer(outputs_right.logits).to(f'cpu:{0}')
+            y_hat_right = self.valence_layer(outputs_right.logits).to(f'cpu:{0}')
 
             x_score = y_hat_right[:, :, 1].mean() - self.baseline_score
             
             scalar_value = x_score.item()
             
-            string_value = f"<Reward:{scalar_value:.2f}>"
+            string_value = f"<valence:{scalar_value:.2f}>"
             
             x_right_toks = self.tokenizer.encode(string_value, return_tensors='pt')
             
@@ -214,8 +214,8 @@ class StrangeLoopNetwork(nn.Module):
             microbatch_mask = all_masks[start_idx:end_idx, :]
             microbatch_targets = all_targets[start_idx:end_idx]
             
-            # Forward pass through the right model and reward layer (11x462)
-            outputs = self.reward_layer(self.right_model(microbatch.to(self.right_model_device), return_dict=True).logits)
+            # Forward pass through the right model and valence layer (11x462)
+            outputs = self.valence_layer(self.right_model(microbatch.to(self.right_model_device), return_dict=True).logits)
             
             # Sum of each row
             row_sums = microbatch_mask.sum(dim=1, keepdim=True)
@@ -255,17 +255,17 @@ class StrangeLoopNetwork(nn.Module):
         self.optimizer_right.step()
         self.optimizer_right.zero_grad()
     
-    # def recompute_trajectory_rewards():
+    # def recompute_trajectory_valences():
     #     for i, (input_ids, x_left, _) in enumerate(self.IDL_trajectory_pairs):
     #         concatenated_input = torch.cat([input_ids, x_left], dim=-1)
     #         outputs_right = self.right_model(concatenated_input, return_dict=True)
-    #         y_hat_right = self.reward_layer(outputs_right.logits)
-    #         recomputed_reward = y_hat_right[0, -1, 0].item()
+    #         y_hat_right = self.valence_layer(outputs_right.logits)
+    #         recomputed_valence = y_hat_right[0, -1, 0].item()
     #         self.IDL_trajectory_pairs[i] = (input_ids, x_left, y_hat_right)
-    def calculate_policy_loss(self, looked_up_values,rewards):
+    def calculate_policy_loss(self, looked_up_values,valences):
         # PPO style objective function
-        surr1 = looked_up_values.mean() * rewards
-        surr2 = torch.clamp(looked_up_values.mean(), min=1.0 - self.epsilon, max=1.0 + self.epsilon) * rewards
+        surr1 = looked_up_values.mean() * valences
+        surr2 = torch.clamp(looked_up_values.mean(), min=1.0 - self.epsilon, max=1.0 + self.epsilon) * valences
         policy_loss = -torch.min(surr1, surr2).mean()
         return policy_loss
         
@@ -278,7 +278,7 @@ class StrangeLoopNetwork(nn.Module):
         # padded_inputs = [nn.functional.pad(pair[1], (0, max_length - pair[1].size(1)), value=self.tokenizer.pad_token_id) for pair in self.IDL_trajectory_pairs]
         # inputs = torch.cat(padded_inputs)
     
-        # Form a batch from IDL_trajectory_pairs and call self.right_model in one shot to compute the rewards
+        # Form a batch from IDL_trajectory_pairs and call self.right_model in one shot to compute the valences
         # batch_concatenated_inputs = [torch.cat([pair[0], pair[1]], dim=-1) for pair in self.IDL_trajectory_pairs]
         # max_concat_length = max(tensor.size(1) for tensor in batch_concatenated_inputs)
         # padded_concatenated_inputs = [nn.functional.pad(tensor, (0, max_concat_length - tensor.size(1)), value=self.tokenizer.pad_token_id) for tensor in batch_concatenated_inputs]
@@ -298,15 +298,15 @@ class StrangeLoopNetwork(nn.Module):
         looked_up_values = torch.gather(log_probs, 2, batch_inputs.unsqueeze(-1))
         looked_up_values = looked_up_values.squeeze(-1).to(f'cuda:{self.left_model_device}')  # Shape: [10, 490]
         
-        # get rewards r(tau)...
+        # get valences r(tau)...
         outputs_right = self.right_model(batch_inputs.to(f'cuda:{self.right_model_device}'), return_dict=True)
-        y_hat_right = self.reward_layer(outputs_right.logits).to(f'cuda:{self.right_model_device}')
+        y_hat_right = self.valence_layer(outputs_right.logits).to(f'cuda:{self.right_model_device}')
         
-        # rewards = y_hat_right[:, -1, 0]  # Extract the relevant rewards
-        rewards = y_hat_right.to(f'cuda:{self.left_model_device}') # batch, seq_len, 2
-        positive_reward = (torch.mean(rewards[:,:,1])-self.baseline_score).item()
+        # valences = y_hat_right[:, -1, 0]  # Extract the relevant valences
+        valences = y_hat_right.to(f'cuda:{self.left_model_device}') # batch, seq_len, 2
+        positive_valence = (torch.mean(valences[:,:,1])-self.baseline_score).item()
         
-        policy_loss = self.calculate_policy_loss(looked_up_values, positive_reward)
+        policy_loss = self.calculate_policy_loss(looked_up_values, positive_valence)
 
         policy_loss.backward() # TODO: should we backprop through to both models?? 
         
@@ -314,7 +314,7 @@ class StrangeLoopNetwork(nn.Module):
         # for dd in self.IDL_trajectory_pairs:
         #    policy_loss.backward()        
     
-        average_reward = positive_reward
+        average_valence = positive_valence
         
 
         #####
@@ -323,7 +323,7 @@ class StrangeLoopNetwork(nn.Module):
         #####
         for dd in self.IDL_trajectory_pairs:
             negative_batch_trajectory = self.add_special_tok_ids(dd["full_output_left_IDL"])
-            negative_reward = dd["full_output_right_IDL"]
+            negative_valence = dd["full_output_right_IDL"]
             
             batch_inputs = negative_batch_trajectory
     
@@ -337,14 +337,14 @@ class StrangeLoopNetwork(nn.Module):
             # Lookup the values
             looked_up_values = torch.gather(log_probs, 2, batch_inputs.unsqueeze(-1))
             
-            policy_loss = self.calculate_policy_loss(looked_up_values, negative_reward)
+            policy_loss = self.calculate_policy_loss(looked_up_values, negative_valence)
 
             policy_loss.backward()
-            average_reward += negative_reward
+            average_valence += negative_valence
             # print("breakkkinng")
             break 
 
-        return policy_loss.item(), average_reward/(len(self.IDL_trajectory_pairs)+1)
+        return policy_loss.item(), average_valence/(len(self.IDL_trajectory_pairs)+1)
 
     def backprop_left_model_Cross_Entropy(self, full, max_microbatch_size=20):
         # Ensure target tokens are in tensor format and move them to the correct device
