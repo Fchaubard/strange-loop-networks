@@ -171,14 +171,15 @@ class SLN:
         self.last_left_model_response = self._decode(output_tokens) #self.tokenizer.decode(self.last_left_model_response.cpu().numpy()[0], skip_special_tokens=True)
         self.last_left_model_response = self.last_left_model_response.split(self.model_tok)[-1]
 
-        self.last_valence_mask_subset = []
+        # self.last_valence_mask_subset = []
+        self.last_valence_mask = []
         self.IDL_count = 0
         self.IDL_limit = 10  # This should be set according to your needs
         
         pdb.set_trace()
         print('Now doing Type 2 thinking to really think about it...')
         while self._stopping_criteria():
-            print(f"IDL count {self.IDL_count}: total_valence: {sum(self.last_valence_mask_subset)} IDL: {self.last_left_model_response}")
+            print(f"IDL count {self.IDL_count}: total_valence: {sum(self.last_valence_mask)} IDL: {self.last_left_model_response}")
             input_text = prompt_text + self.model_tok + self.last_left_model_response
             #input_text = input_text + (self.pad_tok * (self.max_ctx_len - len(input_text)))
             inputs = self.tokenizer(input_texts, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_ctx_len, add_special_tokens=True)
