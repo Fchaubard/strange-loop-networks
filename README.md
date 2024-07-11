@@ -17,7 +17,7 @@ That will produce a checkpoint with the best performing SFT model.
 # Step 3: 
 Generate batches with 'python3 generate_batches.py' in a screen to run forever.
 # Step 4: 
-Train the right model (reward model) with 'python3 train_right.py' in a screen to run forever.
+Train the right model (valence model) with 'python3 train_right.py' in a screen to run forever.
 
 # Step 5: 
 Train the left model (trajectory model) with 'python3 train_left.py' in a screen to run forever.
