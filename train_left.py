@@ -28,15 +28,15 @@ import os
 os.environ["WANDB_API_KEY"] = ""
 
 
-def forward_with_reward_input(current_left_model, input_ids, token_rewards, attention_mask=None, return_dict=True, alpha=1.,baseline=0.5):
+def forward_with_valence_input(current_left_model, input_ids, token_valences, attention_mask=None, return_dict=True, alpha=1.,baseline=0.5):
   
   original_embeddings = current_left_model.get_input_embeddings()
 
   embeddings = original_embeddings(input_ids)
 
-  token_rewards = (torch.tensor(token_rewards).unsqueeze(-1).float() - baseline)*alpha
-  token_rewards = token_rewards.expand(-1, -1, embeddings.size(-1))
-  modified_embeddings = embeddings + token_rewards
+  token_valences = (torch.tensor(token_valences).unsqueeze(-1).float() - baseline)*alpha
+  token_valences = token_valences.expand(-1, -1, embeddings.size(-1))
+  modified_embeddings = embeddings + token_valences
 
   logits = current_left_model(
     inputs_embeds=modified_embeddings,
@@ -89,9 +89,9 @@ if __name__ == '__main__':
   
     save_checkpoint_every_n_batches = 100
 
-    # for handling the reward input signal
-    reward_input_baseline = 0.5
-    reward_input_alpha = 2.
+    # for handling the valence input signal
+    valence_input_baseline = 0.5
+    valence_input_alpha = 2.
      
     #------------------
     # DO SETUP:
@@ -152,10 +152,10 @@ if __name__ == '__main__':
     #------------------
     # TODO: load a batch from ./batch/*.json. Grab the top 100 most recent files, and then select randomly one of them.
     # each b in batch is of format: 
-    #     ({'input_text':input_text, 'true_answer':true_answer, 'reward_mask':reward_mask})
-    #     we can ignore true_answer, and just use input_text as input, and reward_mask as a "per token" reward [0 or 1].
+    #     ({'input_text':input_text, 'true_answer':true_answer, 'valence_mask':valence_mask})
+    #     we can ignore true_answer, and just use input_text as input, and valence_mask as a "per token" valence [0 or 1].
     #         input_text = "Question: blah blah, Answer: blah blah blah"
-    #         reward_mask = [1,1,1,0,0,0,0,1,1,...] which is len(input_text)
+    #         valence_mask = [1,1,1,0,0,0,0,1,1,...] which is len(input_text)
     # then we want to train the model with binary cross entropy 
     num_batches_since_last_checkpoint = 0
     iterr=0
@@ -174,7 +174,7 @@ if __name__ == '__main__':
 
         # get the inputs and outputs ready
         input_texts = [sample['input_text'] for sample in batch]
-        reward_masks = [sample['reward_mask'] for sample in batch]
+        valence_masks = [sample['valence_mask'] for sample in batch]
         true_answers = [sample['true_answer'] for sample in batch]
         
         output_texts = []
@@ -206,16 +206,16 @@ if __name__ == '__main__':
         attention_mask = torch.ones_like(input_ids)
         #attention_mask = inputs['attention_mask'][:,:-1].to(device)
         
-        reward_masks_tensors = [torch.tensor(mask) for mask in reward_masks]
-        reward_masks_tensors_padded = nn.utils.rnn.pad_sequence(reward_masks_tensors, batch_first=True, padding_value=0)
+        valence_masks_tensors = [torch.tensor(mask) for mask in valence_masks]
+        valence_masks_tensors_padded = nn.utils.rnn.pad_sequence(valence_masks_tensors, batch_first=True, padding_value=0)
         
         # Ensure the padded sequences have the desired length
-        reward_masks_tensors_padded = reward_masks_tensors_padded[:, :max_ctx_len]
-        if reward_masks_tensors_padded.size(1) < max_ctx_len:
-            padding = torch.zeros((reward_masks_tensors_padded.size(0), max_ctx_len - reward_masks_tensors_padded.size(1)))
-            reward_masks_tensors_padded = torch.cat([reward_masks_tensors_padded, padding], dim=1)
+        valence_masks_tensors_padded = valence_masks_tensors_padded[:, :max_ctx_len]
+        if valence_masks_tensors_padded.size(1) < max_ctx_len:
+            padding = torch.zeros((valence_masks_tensors_padded.size(0), max_ctx_len - valence_masks_tensors_padded.size(1)))
+            valence_masks_tensors_padded = torch.cat([valence_masks_tensors_padded, padding], dim=1)
               
-        reward_masks_tensors_padded = reward_masks_tensors_padded[:,:-1] #.to(device)
+        valence_masks_tensors_padded = valence_masks_tensors_padded[:,:-1] #.to(device)
         
         batch_size = input_ids.size(0)
 
@@ -232,17 +232,17 @@ if __name__ == '__main__':
             microbatch_input_ids = input_ids[start_idx:end_idx, :].to(device)
             microbatch_output_ids = output_ids[start_idx:end_idx, :].to(device)
             microbatch_attention_mask = attention_mask[start_idx:end_idx, :].to(device)
-            microbatch_reward_masks = reward_masks_tensors_padded[start_idx:end_idx, :].to(device)
+            microbatch_valence_masks = valence_masks_tensors_padded[start_idx:end_idx, :].to(device)
 
           
             # Forward pass through the left model
-            model_outputs = forward_with_reward_input(current_left_model, 
+            model_outputs = forward_with_valence_input(current_left_model, 
                                                 microbatch_input_ids, 
-                                                microbatch_reward_masks, 
+                                                microbatch_valence_masks, 
                                                 attention_mask=microbatch_attention_mask, 
                                                 return_dict=True, 
-                                                alpha=reward_input_alpha, 
-                                                baseline=reward_input_baseline)
+                                                alpha=valence_input_alpha, 
+                                                baseline=valence_input_baseline)
 
             model_outputs = model_outputs['logits']
             #pdb.set_trace()
@@ -255,7 +255,7 @@ if __name__ == '__main__':
             loss = loss_fn(model_outputs_flat, microbatch_output_ids_flat.long())
 
             # Calculate focal loss
-            # targets_one_hot = F.one_hot(microbatch_reward_masks_flat, num_classes=2).float()
+            # targets_one_hot = F.one_hot(microbatch_valence_masks_flat, num_classes=2).float()
             # loss = -1 * sigmoid_focal_loss(outputs_flat, targets_one_hot, alpha=2.0, gamma=4.0, reduction='mean')
             
             # Backpropagation
