@@ -49,11 +49,12 @@ class SLN:
         if not self.left_model_checkpoint_name:
             raise ValueError("Left model checkpoint name must be provided")
         print("LOADING LEFT MODEL FROM: " + self.left_model_checkpoint_name)
+        
         checkpoint = torch.load(self.left_model_checkpoint_name)
         self.current_left_model = AutoModelForCausalLM.from_pretrained(self.base_model_id).to(self.left_model_device)
-        self.current_left_model.load_state_dict(checkpoint['model_state_dict'])
         self.current_left_model.config.pad_token_id = self.tokenizer.pad_token_id
         self.current_left_model.resize_token_embeddings(len(self.tokenizer))
+        self.current_left_model.load_state_dict(checkpoint['model_state_dict'])
         print("consciousness booted! Give me a prompt:")
 
     def _forward_right(self, input_texts):
