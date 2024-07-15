@@ -31,7 +31,7 @@ class SLN:
             raise ValueError("Right model checkpoint name must be provided")
         
         print("LOADING RIGHT MODEL FROM: " + self.right_model_checkpoint_name)
-        checkpoint = torch.load(self.right_model_checkpoint_name)
+        checkpoint = torch.load(self.right_model_checkpoint_name, map_location=torch.device(self.right_model_device))
         self.current_right_model = AutoModelForCausalLM.from_pretrained(self.base_model_id).to(self.right_model_device)
         self.current_right_model.config.pad_token_id = self.tokenizer.pad_token_id
         self.current_right_model.resize_token_embeddings(len(self.tokenizer))
@@ -44,7 +44,7 @@ class SLN:
             nn.Softmax(dim=-1)
         ).to(self.right_model_device)
         try:
-          self.valence_layer.load_state_dict(checkpoint['valence_layer_state_dict'])
+            self.valence_layer.load_state_dict(checkpoint['valence_layer_state_dict'])
         except Exception as e:
             try:
                 self.valence_layer.load_state_dict(checkpoint['reward_layer_state_dict'])
@@ -56,7 +56,7 @@ class SLN:
             raise ValueError("Left model checkpoint name must be provided")
         print("LOADING LEFT MODEL FROM: " + self.left_model_checkpoint_name)
         
-        checkpoint = torch.load(self.left_model_checkpoint_name)
+        checkpoint = torch.load(self.left_model_checkpoint_name, map_location=torch.device(self.left_model_device))
         self.current_left_model = AutoModelForCausalLM.from_pretrained(self.base_model_id).to(self.left_model_device)
         self.current_left_model.config.pad_token_id = self.tokenizer.pad_token_id
         self.current_left_model.resize_token_embeddings(len(self.tokenizer))
@@ -64,41 +64,43 @@ class SLN:
         print("consciousness booted! Give me a prompt:")
 
     def _forward_right(self, input_ids, attention_mask):
-        input_ids = input_ids.to(self.right_model_device)
-        attention_mask = attention_mask.to(self.right_model_device)
-        logits = self.current_right_model(input_ids, attention_mask=attention_mask, return_dict=True).logits
-        outputs = self.valence_layer(logits) # which is batch x seq x 2
-        valence_mask = torch.round(softmax(outputs, dim=-1))[0,:,1]
-        return valence_mask
+        with torch.no_grad():  
+            input_ids = input_ids.to(self.right_model_device)
+            attention_mask = attention_mask.to(self.right_model_device)
+            logits = self.current_right_model(input_ids, attention_mask=attention_mask, return_dict=True).logits
+            outputs = self.valence_layer(logits) # which is batch x seq x 2 (the second channel is the positive valence )
+            valence_mask = torch.round(softmax(outputs, dim=-1))[0,:,1]
+            return valence_mask
 
     def _forward_left(self, input_ids, input_valence, attention_mask):
-        input_ids = input_ids.to(self.left_model_device)
-        attention_mask = attention_mask.to(self.left_model_device)
-        input_valence = input_valence.to(self.left_model_device)
-        
-        # valence_masks_tensors_padded = nn.utils.rnn.pad_sequence([input_valence], batch_first=True, padding_value=0)
-
-        # Ensure the padded sequences have the desired length
-        # valence_masks_tensors_padded = valence_masks_tensors_padded[:, :self.max_ctx_len]
-        # if valence_masks_tensors_padded.size(1) < self.max_ctx_len:
-        #     padding = torch.zeros((valence_masks_tensors_padded.size(0), self.max_ctx_len - valence_masks_tensors_padded.size(1))).to(self.left_model_device)
-        #     valence_masks_tensors_padded = torch.cat([valence_masks_tensors_padded, padding], dim=1)
-        
-        model_outputs = self._forward_left_with_valence_input(
-            self.current_left_model,
-            input_ids,
-            #valence_masks_tensors_padded,
-            input_valance,
-            attention_mask=attention_mask,
-            return_dict=True,
-            alpha=self.valence_input_alpha,
-            baseline=self.valence_input_baseline
-        )
-
-        model_outputs = model_outputs['logits']  
-        generated_tokens = torch.argmax(model_outputs, dim=-1) # TODO: greedy sampling?? or be smarter..
-        
-        return generated_tokens
+        with torch.no_grad():  
+            input_ids = input_ids.to(self.left_model_device)
+            attention_mask = attention_mask.to(self.left_model_device)
+            input_valence = input_valence.to(self.left_model_device)
+            
+            # valence_masks_tensors_padded = nn.utils.rnn.pad_sequence([input_valence], batch_first=True, padding_value=0)
+    
+            # Ensure the padded sequences have the desired length
+            # valence_masks_tensors_padded = valence_masks_tensors_padded[:, :self.max_ctx_len]
+            # if valence_masks_tensors_padded.size(1) < self.max_ctx_len:
+            #     padding = torch.zeros((valence_masks_tensors_padded.size(0), self.max_ctx_len - valence_masks_tensors_padded.size(1))).to(self.left_model_device)
+            #     valence_masks_tensors_padded = torch.cat([valence_masks_tensors_padded, padding], dim=1)
+            
+            model_outputs = self._forward_left_with_valence_input(
+                self.current_left_model,
+                input_ids,
+                #valence_masks_tensors_padded,
+                input_valence,
+                attention_mask=attention_mask,
+                return_dict=True,
+                alpha=self.valence_input_alpha,
+                baseline=self.valence_input_baseline
+            )
+    
+            model_outputs = model_outputs['logits']  
+            generated_tokens = torch.argmax(model_outputs, dim=-1) # TODO: greedy sampling?? or be smarter..
+            
+            return generated_tokens
 
     def _forward_left_with_valence_input(self, 
                                         current_left_model, 
@@ -108,32 +110,35 @@ class SLN:
                                         return_dict=True, 
                                         alpha=1., 
                                         baseline=0.5):
-        original_embeddings = current_left_model.get_input_embeddings()
-        embeddings = original_embeddings(input_ids)
-
-        token_valences = (token_valences.unsqueeze(-1).float() - baseline) * alpha
-        token_valences = token_valences.expand(-1, -1, embeddings.size(-1))
-        modified_embeddings = embeddings + token_valences
-
-        logits = current_left_model(
-            inputs_embeds=modified_embeddings,
-            attention_mask=attention_mask,
-            return_dict=return_dict
-        ).logits
-
-        if not return_dict:
-            return logits
-
-        return {"logits": logits}
+        with torch.no_grad():  
+            original_embeddings = current_left_model.get_input_embeddings()
+            embeddings = original_embeddings(input_ids)
+    
+            token_valences = (token_valences.unsqueeze(-1).float() - baseline) * alpha
+            token_valences = token_valences.expand(-1, -1, embeddings.size(-1))
+            modified_embeddings = embeddings + token_valences
+    
+            logits = current_left_model(
+                inputs_embeds=modified_embeddings,
+                attention_mask=attention_mask,
+                return_dict=return_dict
+            ).logits
+    
+            if not return_dict:
+                return logits
+    
+            return {"logits": logits}
 
     def _stopping_criteria(self):
+        # return True if we should stop IDL, False if we should not
         if self.IDL_count > self.IDL_limit:
-            self.last_left_model_response = "I do not know.. I am not smart enough yet!"
+            
+            self.last_left_model_response = self.last_left_model_response + "|||| .... I do not know.. I am not smart enough yet!"
             return False #break out of IDL
         else:
             return True #continue with IDL
 
-        if sum(self.valence_subset) >= 0.95 * len(self.valence_subset): # meaning mostly 1s valence in the left response. 
+        if sum(self.last_valence_mask) >= 0.98 * len(self.last_valence_mask): # meaning mostly 1s valence in the left response. 
             return False #we got a good answer! Break out of IDL! 
         return True #continue with IDL.. not there yet.. 
         
@@ -143,76 +148,96 @@ class SLN:
         
 
     def forward(self, prompt_text):
-        self.prompt_tokens = self.tokenizer(prompt_text + self.model_tok, return_tensors="pt", padding=True, truncation=True)
-        
-        pdb.set_trace()
-        
-        print('generating Type 1 response:')
-
-        self.output_tokens = self.current_left_model.generate(
-            self.prompt_tokens.input_ids.to(self.left_model_device),
-            attention_mask=self.prompt_tokens.attention_mask.to(self.left_model_device),
-            max_new_tokens= 100, #self.max_ctx_len - len(prompt_text),
-            #max_length=self.max_ctx_len/2,  # Maximum length of the sequence
-            eos_token_id=self.tokenizer.eos_token_id,  # Stop when the end-of-sequence token is generated
-            num_beams=5,  # Use beam search with 5 beams
-            early_stopping=True,  # Stop early when the beams are sufficiently similar
-            pad_token_id=self.tokenizer.pad_token_id
-        )
-
-        num_generated_tokens = self.output_tokens.shape[1] - self.prompt_tokens.input_ids[1]
-        
-        self.last_left_model_response = self._decode(output_tokens) #self.tokenizer.decode(self.last_left_model_response.cpu().numpy()[0], skip_special_tokens=True)
-        self.last_left_model_response = self.last_left_model_response.split(self.model_tok)[-1]
-
-        # self.last_valence_mask_subset = []
-        self.last_valence_mask = []
-        self.IDL_count = 0
-        self.IDL_limit = 10  # This should be set according to your needs
-        
-        pdb.set_trace()
-        print('Now doing Type 2 thinking to really think about it...')
-        while self._stopping_criteria():
-            # input_text = prompt_text + self.model_tok + self.last_left_model_response
-            #input_text = input_text + (self.pad_tok * (self.max_ctx_len - len(input_text)))
-            # inputs = self.tokenizer(input_text, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_ctx_len, add_special_tokens=True)
+        with torch.no_grad():  
+            # TODO what does padding and truncation do? remove for now..
+            self.prompt_tokens = self.tokenizer(prompt_text + self.model_tok, return_tensors="pt") #padding=True, truncation=True)
             
-            # input_ids = inputs['input_ids']
-            attention_mask=torch.ones_like(self.output_tokens)
-
-            # Forward pass right model
-            self.last_valence_mask = self._forward_right(self.output_tokens, attention_mask)
-
-            self.valence_subset = self.last_valence_mask[num_generated_tokens:] # take only the valence for the generated tokens
-            
-            print(f"IDL count {self.IDL_count}: total_valence: {sum(self.valence_subset)} IDL: {self.last_left_model_response}")
-
-            pdb.set_trace()
-
-            # Forward pass left model and update our output_tokens with the new valence scores
-            self.output_tokens = self._forward_left(self.output_tokens, self.last_valence_mask, attention_mask).to("cpu")
-
-            #TODO: CHECK IF WE HAVE TO REMOVE [0] or not.
-            
-            self.last_left_model_response = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-            
-            response_parts = self.last_left_model_response.split(self.model_tok)
-            if len(response_parts) > 1:
-                self.last_left_model_response = response_parts[-1]
-            else:
-                raise ValueError(f"The response does not contain the model token: {self.model_tok}")
-        
             pdb.set_trace()
             
-            self.IDL_count += 1
-        return self.last_left_model_response
+            print('generating Type 1 response:')
+    
+            self.output_tokens = self.current_left_model.generate(
+                self.prompt_tokens.input_ids.to(self.left_model_device),
+                attention_mask=self.prompt_tokens.attention_mask.to(self.left_model_device),
+                max_new_tokens = 100, #self.max_ctx_len - len(prompt_text),
+                #max_length=self.max_ctx_len/2,  # Maximum length of the sequence
+                eos_token_id=self.tokenizer.eos_token_id,  # Stop when the end-of-sequence token is generated
+                num_beams=5,  # Use beam search with 5 beams
+                early_stopping=True,  # Stop early when the beams are sufficiently similar
+                pad_token_id=self.tokenizer.pad_token_id
+            )
+    
+            num_generated_tokens = self.output_tokens.shape[1] - self.prompt_tokens.input_ids.shape[1]
+            
+            self.output_tokens = self.output_tokens[-num_generated_tokens:]
+            self.last_left_model_response = self._decode(self.output_tokens) #self.tokenizer.decode(self.last_left_model_response.cpu().numpy()[0], skip_special_tokens=True)
+            
+            # self.last_left_model_response = self.last_left_model_response.split(self.model_tok)[-1]
+            # self.last_valence_mask_subset = []
+            
+            self.last_valence_mask = []
+            self.IDL_count = 0
+            self.IDL_limit = 10  # This should be set according to your needs
+            
+            pdb.set_trace()
+            print('Now doing Type 2 thinking to really think about it...')
+            
+            # TODO: DO WE WANT TO ADD MORE "SPACE" FOR THE MODEL TO THINK? ADD PADDING! 
+            # size_of_padding = 40
+            # num_generated_tokens = num_generated_tokens + size_of_padding
+            # self.output_tokens = self.output_tokens.extend(self.tokenizer.pad_token_id * size_of_padding)
+            
+            while True:
+                
+                # inputs = self.tokenizer(input_text, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_ctx_len, add_special_tokens=True)
+                # input_ids = inputs['input_ids']
+                pdb.set_trace()
+                
+                input_ids = torch.cat([self.prompt_tokens.input_ids.to(self.right_model_device), self.output_tokens.to(self.right_model_device)], dim=-1)
+                
+                attention_mask = torch.ones_like(input_ids).to(self.right_model_device)
+    
+                # Forward pass right model
+                self.last_valence_mask = self._forward_right(input_ids, attention_mask)
+    
+                print(f"IDL count {self.IDL_count}: total_valence: {sum(self.last_valence_mask) / len(self.last_valence_mask) } IDL: {self.last_left_model_response}")
+    
+                pdb.set_trace()
+                if not self._stopping_criteria():
+                    # score is high enough or we have hit our limit
+                    break
+                
+                # score not high enough.. we need to keep trying
+                
+                # Forward pass left model and update our output_tokens with the new valence scores
+                input_ids = input_ids.to(self.left_model_device)
+                self.last_valence_mask = self.last_valence_mask.to(self.left_model_device)
+                attention_mask = attention_mask.to(self.left_model_device)
+                
+                self.output_tokens = self._forward_left(input_ids, self.last_valence_mask, attention_mask)
+                self.output_tokens = self.output_tokens[-num_generated_tokens:]
+                
+                #TODO: CHECK IF WE HAVE TO REMOVE [0] or not.
+                self.last_left_model_response = self.tokenizer.decode(self.output_tokens[0], skip_special_tokens=True)
+    
+                #             response_parts = self.last_left_model_response.split(self.model_tok)
+                #             if len(response_parts) > 1:
+                #                 self.last_left_model_response = response_parts[-1]
+                #             else:
+                #                 raise ValueError(f"The response does not contain the model token: {self.model_tok} and model response: {self.last_left_model_response}")
+    
+                pdb.set_trace()
+                
+                self.IDL_count += 1
+            return self.last_left_model_response
 
 
 if __name__ == "__main__":
     print("Booting consciousness... one sec.. :)")
-    
-    left_model_checkpoint = "/root/left_checkpoint_20240711093303_iter_100_loss_55.50.pth" #"<path to right model checkpoint>"
-    right_model_checkpoint = "/root/right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" #"<path to left model checkpoint>"
+    left_model_checkpoint = "/left_checkpoints/left_checkpoint_20240715113638_iter_700_loss_43.06.pth" #"<path to right model checkpoint>"
+    right_model_checkpoint = "/right_checkpoints/right_checkpoint_20240715155144_iter_10_loss_6.31.pth" #"<path to left model checkpoint>"
+    # left_model_checkpoint = "./left_checkpoint_20240711093303_iter_100_loss_55.50.pth" #"<path to right model checkpoint>"
+    # right_model_checkpoint = "./right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" #"<path to left model checkpoint>"
     
     sln = SLN(right_model_checkpoint, left_model_checkpoint)
   
