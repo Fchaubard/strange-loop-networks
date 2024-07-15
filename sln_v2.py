@@ -69,7 +69,8 @@ class SLN:
             attention_mask = attention_mask.to(self.right_model_device)
             logits = self.current_right_model(input_ids, attention_mask=attention_mask, return_dict=True).logits
             outputs = self.valence_layer(logits) # which is batch x seq x 2 (the second channel is the positive valence )
-            valence_mask = torch.round(softmax(outputs, dim=-1))[0,:,1]
+            #valence_mask = torch.round(softmax(outputs, dim=-1))[0,:,1]
+            valence_mask = softmax(outputs, dim=-1)[0,:,1]
             return valence_mask
 
     def _forward_left(self, input_ids, input_valence, attention_mask):
@@ -115,7 +116,7 @@ class SLN:
             embeddings = original_embeddings(input_ids)
     
             token_valences = (token_valences.unsqueeze(-1).float() - baseline) * alpha
-            token_valences = token_valences.expand(-1, -1, embeddings.size(-1))
+            token_valences = token_valences.expand(-1, embeddings.size(-1))
             modified_embeddings = embeddings + token_valences
     
             logits = current_left_model(
@@ -152,8 +153,6 @@ class SLN:
             # TODO what does padding and truncation do? remove for now..
             self.prompt_tokens = self.tokenizer(prompt_text + self.model_tok, return_tensors="pt") #padding=True, truncation=True)
             
-            pdb.set_trace()
-            
             print('generating Type 1 response:')
     
             self.output_tokens = self.current_left_model.generate(
@@ -179,7 +178,7 @@ class SLN:
             self.IDL_count = 0
             self.IDL_limit = 10  # This should be set according to your needs
             
-            pdb.set_trace()
+            
             print('Now doing Type 2 thinking to really think about it...')
             
             # TODO: DO WE WANT TO ADD MORE "SPACE" FOR THE MODEL TO THINK? ADD PADDING! 
@@ -191,7 +190,6 @@ class SLN:
                 
                 # inputs = self.tokenizer(input_text, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_ctx_len, add_special_tokens=True)
                 # input_ids = inputs['input_ids']
-                pdb.set_trace()
                 
                 input_ids = torch.cat([self.prompt_tokens.input_ids.to(self.right_model_device), self.output_tokens.to(self.right_model_device)], dim=-1)
                 
@@ -199,10 +197,11 @@ class SLN:
     
                 # Forward pass right model
                 self.last_valence_mask = self._forward_right(input_ids, attention_mask)
+                one_line = ' '.join(map(str, self.last_valence_mask.tolist()))
+
+                print(f"IDL count {self.IDL_count}: total_valence: {sum(self.last_valence_mask) / len(self.last_valence_mask) } IDL: {self.last_left_model_response} per_tok_valence: {one_line}")
     
-                print(f"IDL count {self.IDL_count}: total_valence: {sum(self.last_valence_mask) / len(self.last_valence_mask) } IDL: {self.last_left_model_response}")
-    
-                pdb.set_trace()
+                
                 if not self._stopping_criteria():
                     # score is high enough or we have hit our limit
                     break
@@ -216,6 +215,12 @@ class SLN:
                 
                 self.output_tokens = self._forward_left(input_ids, self.last_valence_mask, attention_mask)
                 self.output_tokens = self.output_tokens[-num_generated_tokens:]
+                # also, we may find the first padding tok, and eliminate everything after it? 
+                # first_pad_tok_index = torch.nonzero(torch.eq(self.output_tokens, 
+                #                                self.tokenizer.pad_token_id), 
+                #                                as_tuple=True)[1][0].item()
+
+
                 
                 #TODO: CHECK IF WE HAVE TO REMOVE [0] or not.
                 self.last_left_model_response = self.tokenizer.decode(self.output_tokens[0], skip_special_tokens=True)
@@ -226,7 +231,6 @@ class SLN:
                 #             else:
                 #                 raise ValueError(f"The response does not contain the model token: {self.model_tok} and model response: {self.last_left_model_response}")
     
-                pdb.set_trace()
                 
                 self.IDL_count += 1
             return self.last_left_model_response
@@ -234,10 +238,10 @@ class SLN:
 
 if __name__ == "__main__":
     print("Booting consciousness... one sec.. :)")
-    left_model_checkpoint = "/left_checkpoints/left_checkpoint_20240715113638_iter_700_loss_43.06.pth" #"<path to right model checkpoint>"
-    right_model_checkpoint = "/right_checkpoints/right_checkpoint_20240715155144_iter_10_loss_6.31.pth" #"<path to left model checkpoint>"
+    left_model_checkpoint = "/left_checkpoints/left_checkpoint_20240715173212_iter_800_loss_37.63.pth" #"<path to right model checkpoint>"
+    # right_model_checkpoint = "/right_checkpoints/right_checkpoint_20240715155144_iter_10_loss_6.31.pth" #"<path to left model checkpoint>"
     # left_model_checkpoint = "./left_checkpoint_20240711093303_iter_100_loss_55.50.pth" #"<path to right model checkpoint>"
-    # right_model_checkpoint = "./right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" #"<path to left model checkpoint>"
+    right_model_checkpoint = "right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" #"<path to left model checkpoint>"
     
     sln = SLN(right_model_checkpoint, left_model_checkpoint)
   
@@ -246,6 +250,7 @@ if __name__ == "__main__":
 
     model_response = sln.forward(prompt_text)
     
-    print("Model Response:", model_response)
     print("Target Response:", target_response)
+    print("="*50)
+    print("Model Response:", model_response)
     
