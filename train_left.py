@@ -25,7 +25,7 @@ from torchvision.ops import sigmoid_focal_loss
 import wandb
 import os
 
-os.environ["WANDB_API_KEY"] = ""
+os.environ["WANDB_API_KEY"] = "cce47709d839921f0b13533529f31c8af7f3f4dc"
 
 
 def forward_with_valence_input(current_left_model, input_ids, token_valences, attention_mask=None, return_dict=True, alpha=1.,baseline=0.5):
@@ -57,16 +57,16 @@ if __name__ == '__main__':
     # THINGS TO UPDATE:
     #------------------
     # Define the batches_directory file path
-    batches_directory = "./batches/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
+    batches_directory = "/sln_batches/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
     
     # update what device you want to train this model on
     device = 'cuda:0'#'cpu'#
 
     # update what model you want to use WARNING: IF YOU WANT TO START FROM A CHECKPOINT OF LEFT MODEL, THIS IS THE PLACE TO DO IT:
     model_id = "EleutherAI/pythia-410M" #"EleutherAI/pythia-1b" #"EleutherAI/pythia-70m-v0"
-    left_model_checkpoint_name = None # use this if you want to load from a checkpoint, else will load from pythia pretrained
+    left_model_checkpoint_name = "/left-strange-loop-network-410m/left_checkpoint_20240715173212_iter_800_loss_37.63.pth" # use this if you want to load from a checkpoint, else will load from pythia pretrained
     
-    left_model_directory = "./left_checkpoints/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
+    left_model_directory = "/left_checkpoints/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
     
     macro_batch_size = 1 
     pad_tok = '[PAD]'
@@ -84,7 +84,7 @@ if __name__ == '__main__':
     patience=200
     cooldown=200
 
-    max_microbatch_size = 3 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
+    max_microbatch_size = 10 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
     max_ctx_len = 2000 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
   
     save_checkpoint_every_n_batches = 100
@@ -92,11 +92,13 @@ if __name__ == '__main__':
     # for handling the valence input signal
     valence_input_baseline = 0.5
     valence_input_alpha = 2.
-     
+    include_wandb = True
+
     #------------------
     # DO SETUP:
     #------------------
-    wandb.init(project=wandb_project_name)
+    if include_wandb:
+        wandb.init(project=wandb_project_name)
     # Check if the batches_directory exists
     if not os.path.exists(batches_directory):
         # If the directory does not exist, create it
@@ -199,8 +201,8 @@ if __name__ == '__main__':
            continue
 
         
-        inputs = tokenizer(input_texts, return_tensors='pt', padding='max_length', truncation=True, max_length=max_ctx_len, add_special_tokens=True) # TODO: MAKE SURE THIS INCLUDES BOS token
-        outputs = tokenizer(output_texts, return_tensors='pt', padding='max_length', truncation=True, max_length=max_ctx_len,  add_special_tokens=True) # TODO: MAKE SURE THIS DOES NOT! 
+        inputs = tokenizer(input_texts, return_tensors='pt', padding=True, truncation=True, add_special_tokens=True) #max_length=max_ctx_len, add_special_tokens=True) # TODO: MAKE SURE THIS INCLUDES BOS token
+        outputs = tokenizer(output_texts, return_tensors='pt', padding=True, truncation=True, add_special_tokens=True) #padding='max_length', truncation=True, max_length=max_ctx_len,  add_special_tokens=True) # TODO: MAKE SURE THIS DOES NOT! 
         
         input_ids = inputs['input_ids'][:,:-1] #.to(device) # drop the last column
         output_ids = outputs['input_ids'][:,1:] #.to(device) # shift one right 
@@ -211,10 +213,10 @@ if __name__ == '__main__':
         valence_masks_tensors_padded = nn.utils.rnn.pad_sequence(valence_masks_tensors, batch_first=True, padding_value=0)
         
         # Ensure the padded sequences have the desired length
-        valence_masks_tensors_padded = valence_masks_tensors_padded[:, :max_ctx_len]
-        if valence_masks_tensors_padded.size(1) < max_ctx_len:
-            padding = torch.zeros((valence_masks_tensors_padded.size(0), max_ctx_len - valence_masks_tensors_padded.size(1)))
-            valence_masks_tensors_padded = torch.cat([valence_masks_tensors_padded, padding], dim=1)
+        #valence_masks_tensors_padded = valence_masks_tensors_padded[:, :max_ctx_len]
+        #if valence_masks_tensors_padded.size(1) < max_ctx_len:
+        #    padding = torch.zeros((valence_masks_tensors_padded.size(0), max_ctx_len - valence_masks_tensors_padded.size(1)))
+        #    valence_masks_tensors_padded = torch.cat([valence_masks_tensors_padded, padding], dim=1)
               
         valence_masks_tensors_padded = valence_masks_tensors_padded[:,:-1] #.to(device)
         
@@ -248,10 +250,11 @@ if __name__ == '__main__':
             model_outputs = model_outputs['logits']
             #pdb.set_trace()
             # Calculate binary cross-entropy loss for each token
-            microbatch_output_ids_flat = microbatch_output_ids.view(-1).long()
+            
+            microbatch_output_ids_padded = torch.nn.functional.pad(microbatch_output_ids, (0, model_outputs.shape[1] - microbatch_output_ids.shape[1]), value=tokenizer.eos_token_id)
+            microbatch_output_ids_flat = microbatch_output_ids_padded.view(-1).long()
             model_outputs_flat = model_outputs.view(-1, model_outputs.shape[-1])
             #model_outputs_flat = model_outputs.view(-1, 2)  # Flatten the outputs
-
             loss_fn = nn.CrossEntropyLoss()
             loss = loss_fn(model_outputs_flat, microbatch_output_ids_flat.long())
 
@@ -286,7 +289,8 @@ if __name__ == '__main__':
             accuracy = total_correct / (input_ids.size(0) * input_ids.size(1))  # Per-token accuracy.. TODO: This is actually just the last iter.. not the full macro_batch.. need to fix.. too lazy..
             message = {"left_BCE_loss": round(float(total_loss),2), "left_per_tok_acc": round(float(accuracy),2), "lr": optimizer_left.param_groups[0]['lr'], "norm_grad": round(float(normed_grad),2)}
 
-            wandb.log(message)
+            if include_wandb:
+                wandb.log(message)
             print(message)
         
         iterr += 1

@@ -107,12 +107,12 @@ if __name__ == '__main__':
     # Define the gsm8k file path... or if you want, create more programs somewhere else.
     gsm_file_path = '../sentence_augs/gsm8k_train_programs.txt'
     
-    batches_directory = "./sln_batches/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
+    batches_directory = "/sln_batches/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
     number_of_programs_to_sample = 1
     samples_per_program = 1
     
-    left_model_checkpoint = "/left_checkpoints/left_checkpoint_20240715173212_iter_800_loss_37.63.pth" #"<path to right model checkpoint>"
-    right_model_checkpoint = "/right_checkpoints/right_checkpoint_20240715155144_iter_10_loss_6.31.pth"
+    left_model_checkpoint = "/left-strange-loop-network-410m/left_checkpoint_20240715173212_iter_800_loss_37.63.pth" #"<path to right model checkpoint>"
+    right_model_checkpoint = "/right-strange-loop-network-410m/right_checkpoint_20240709113005_iter_2000_loss_0.52.pth"
     #right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" #"<path to left model checkpoint>"
     
     sln = SLN(right_model_checkpoint, left_model_checkpoint, verbose=False, return_all_IDLs=True)
