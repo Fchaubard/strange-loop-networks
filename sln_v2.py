@@ -6,13 +6,28 @@ from torch.nn.functional import softmax
 import pdb
 
 class SLN:
-    def __init__(self, right_model_checkpoint_name, left_model_checkpoint_name):
+    def __init__(self, 
+                 right_model_checkpoint_name, 
+                 left_model_checkpoint_name, 
+                 verbose=True, 
+                 return_type1_answer=False, 
+                 return_highest_valence=True, 
+                 return_all_IDLs=False,
+                 round_valence=False,
+                 left_model_device="cuda:0",
+                 right_model_device="cuda:0"
+                ):
       with torch.no_grad():  
         self.right_model_checkpoint_name = right_model_checkpoint_name
         self.left_model_checkpoint_name = left_model_checkpoint_name
+        self.return_type1_answer = return_type1_answer
+        self.return_highest_valence = return_highest_valence # if false, returns LAST IDL as the answer vs. highest valence
+        self.return_all_IDLs = return_all_IDLs
+        self.round_valence = round_valence
+        self.verbose = verbose
         
-        self.left_model_device = "cuda:0"
-        self.right_model_device = "cuda:0"
+        self.left_model_device = left_model_device
+        self.right_model_device = right_model_device
         
         self.model_tok = '<left model>'
         self.pad_tok = '[PAD]'
@@ -69,8 +84,8 @@ class SLN:
             attention_mask = attention_mask.to(self.right_model_device)
             logits = self.current_right_model(input_ids, attention_mask=attention_mask, return_dict=True).logits
             outputs = self.valence_layer(logits) # which is batch x seq x 2 (the second channel is the positive valence )
-            #valence_mask = torch.round(softmax(outputs, dim=-1))[0,:,1]
-            valence_mask = softmax(outputs, dim=-1)[0,:,1]
+            valence_mask = torch.round(softmax(outputs, dim=-1))[0,:,1]
+            # valence_mask = softmax(outputs, dim=-1)[0,:,1]
             return valence_mask
 
     def _forward_left(self, input_ids, input_valence, attention_mask):
@@ -152,8 +167,9 @@ class SLN:
         with torch.no_grad():  
             # TODO what does padding and truncation do? remove for now..
             self.prompt_tokens = self.tokenizer(prompt_text + self.model_tok, return_tensors="pt") #padding=True, truncation=True)
-            
-            print('generating Type 1 response:')
+            IDLs = []
+            if self.verbose:
+                print('generating Type 1 response:')
     
             self.output_tokens = self.current_left_model.generate(
                 self.prompt_tokens.input_ids.to(self.left_model_device),
@@ -165,12 +181,13 @@ class SLN:
                 early_stopping=True,  # Stop early when the beams are sufficiently similar
                 pad_token_id=self.tokenizer.pad_token_id
             )
-    
+            
             num_generated_tokens = self.output_tokens.shape[1] - self.prompt_tokens.input_ids.shape[1]
             
             self.output_tokens = self.output_tokens[-num_generated_tokens:]
             self.last_left_model_response = self._decode(self.output_tokens) #self.tokenizer.decode(self.last_left_model_response.cpu().numpy()[0], skip_special_tokens=True)
-            
+            if self.return_type1_answer:
+                return self.last_left_model_response
             # self.last_left_model_response = self.last_left_model_response.split(self.model_tok)[-1]
             # self.last_valence_mask_subset = []
             
@@ -178,19 +195,21 @@ class SLN:
             self.IDL_count = 0
             self.IDL_limit = 10  # This should be set according to your needs
             
-            
-            print('Now doing Type 2 thinking to really think about it...')
+            if self.verbose:
+                print('Now doing Type 2 thinking to really think about it...')
             
             # TODO: DO WE WANT TO ADD MORE "SPACE" FOR THE MODEL TO THINK? ADD PADDING! 
             # size_of_padding = 40
             # num_generated_tokens = num_generated_tokens + size_of_padding
             # self.output_tokens = self.output_tokens.extend(self.tokenizer.pad_token_id * size_of_padding)
             
+            
+            highest_valence = -1.
             while True:
                 
                 # inputs = self.tokenizer(input_text, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_ctx_len, add_special_tokens=True)
                 # input_ids = inputs['input_ids']
-                
+                    
                 input_ids = torch.cat([self.prompt_tokens.input_ids.to(self.right_model_device), self.output_tokens.to(self.right_model_device)], dim=-1)
                 
                 attention_mask = torch.ones_like(input_ids).to(self.right_model_device)
@@ -199,8 +218,24 @@ class SLN:
                 self.last_valence_mask = self._forward_right(input_ids, attention_mask)
                 one_line = ' '.join(map(str, self.last_valence_mask.tolist()))
 
-                print(f"IDL count {self.IDL_count}: total_valence: {sum(self.last_valence_mask) / len(self.last_valence_mask) } IDL: {self.last_left_model_response} per_tok_valence: {one_line}")
-    
+                current_valence = int(100.0*sum(self.last_valence_mask) / len(self.last_valence_mask))
+                
+                if self.verbose:
+                    # print(f"IDL count {self.IDL_count}: total_valence: {current_valence } IDL: {self.last_left_model_response} per_tok_valence: {one_line}")
+                    print(f"IDL count {self.IDL_count}: total_valence: {current_valence } IDL: {self.last_left_model_response} ")
+                
+                if current_valence > highest_valence:
+                    highest_valence = current_valence
+                    highest_valence_response = self.last_left_model_response
+
+                if self.return_all_IDLs:
+                    IDLs.append( ( {
+                                    "IDL_count": self.IDL_count,
+                                    "left_model_response": self.last_left_model_response,
+                                    "right_model_valence": self.last_valence_mask
+                                   }
+                                 )
+                               )
                 
                 if not self._stopping_criteria():
                     # score is high enough or we have hit our limit
@@ -233,15 +268,20 @@ class SLN:
     
                 
                 self.IDL_count += 1
+
+            if self.return_highest_valence:
+                self.last_left_model_response = highest_valence_response
+            if self.return_all_IDLs:
+                return IDLs
             return self.last_left_model_response
 
 
 if __name__ == "__main__":
     print("Booting consciousness... one sec.. :)")
-    left_model_checkpoint = "/left_checkpoints/left_checkpoint_20240715173212_iter_800_loss_37.63.pth" #"<path to right model checkpoint>"
+    left_model_checkpoint = "/left_checkpoints/left_checkpoint_20240715113638_iter_700_loss_43.06.pth" #"<path to right model checkpoint>"
     # right_model_checkpoint = "/right_checkpoints/right_checkpoint_20240715155144_iter_10_loss_6.31.pth" #"<path to left model checkpoint>"
     # left_model_checkpoint = "./left_checkpoint_20240711093303_iter_100_loss_55.50.pth" #"<path to right model checkpoint>"
-    right_model_checkpoint = "right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" #"<path to left model checkpoint>"
+    right_model_checkpoint = "/root/right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" #"<path to left model checkpoint>"
     
     sln = SLN(right_model_checkpoint, left_model_checkpoint)
   
