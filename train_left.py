@@ -81,13 +81,13 @@ if __name__ == '__main__':
 
     # for scheduler
     factor=0.5
-    patience=200
-    cooldown=200
+    patience=500
+    cooldown=500
 
     max_microbatch_size = 10 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
     max_ctx_len = 2000 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
   
-    save_checkpoint_every_n_batches = 100
+    save_checkpoint_every_n_batches = 500
 
     # for handling the valence input signal
     valence_input_baseline = 0.5

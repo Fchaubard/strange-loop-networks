@@ -61,7 +61,7 @@ if __name__ == '__main__':
 
     max_microbatch_size = 20 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
 
-    save_checkpoint_every_n_batches = 1000
+    save_checkpoint_every_n_batches = 500
     
     include_wandb = True
     #------------------
