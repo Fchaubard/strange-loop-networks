@@ -14,6 +14,8 @@ class SLN:
                  return_highest_valence=True, 
                  return_all_IDLs=False,
                  round_valence=False,
+                 decrement_future_negative_logits_with_rewards=False,
+                 add_thinking_space=False,
                  left_model_device="cuda:0",
                  right_model_device="cuda:0"
                 ):
@@ -24,6 +26,8 @@ class SLN:
         self.return_highest_valence = return_highest_valence # if false, returns LAST IDL as the answer vs. highest valence
         self.return_all_IDLs = return_all_IDLs
         self.round_valence = round_valence
+        self.decrement_future_negative_logits_with_rewards = decrement_future_negative_logits_with_rewards
+        self.add_thinking_space = add_thinking_space
         self.verbose = verbose
         
         self.left_model_device = left_model_device
@@ -84,11 +88,14 @@ class SLN:
             attention_mask = attention_mask.to(self.right_model_device)
             logits = self.current_right_model(input_ids, attention_mask=attention_mask, return_dict=True).logits
             outputs = self.valence_layer(logits) # which is batch x seq x 2 (the second channel is the positive valence )
-            valence_mask = torch.round(softmax(outputs, dim=-1))[0,:,1]
-            # valence_mask = softmax(outputs, dim=-1)[0,:,1]
+            
+            if self.round_valence:
+                valence_mask = torch.round(softmax(outputs, dim=-1))[0,:,1]
+            else:
+                valence_mask = softmax(outputs, dim=-1)[0,:,1]
             return valence_mask
 
-    def _forward_left(self, input_ids, input_valence, attention_mask):
+    def _forward_left(self, input_ids, input_valence, attention_mask, zero_out_bit_flag=None):
         with torch.no_grad():  
             input_ids = input_ids.to(self.left_model_device)
             attention_mask = attention_mask.to(self.left_model_device)
@@ -114,6 +121,12 @@ class SLN:
             )
     
             model_outputs = model_outputs['logits']  
+
+            if self.decrement_future_negative_logits_with_rewards:
+                # model_outputs (seq x Vocab), we want to -INF all logits that we know have 0 valence
+                # TODO: Do we want to do float('-inf') or do we want to do something less severe like -1000... hmm..
+                model_outputs = model_outputs.masked_fill(zero_out_bit_flag.bool().to(model_outputs.device), float('-inf'))
+            
             generated_tokens = torch.argmax(model_outputs, dim=-1) # TODO: greedy sampling?? or be smarter..
             
             return generated_tokens
@@ -161,35 +174,63 @@ class SLN:
     def _decode(self, output_tokens):
         txt = self.tokenizer.decode(output_tokens.cpu().numpy()[0], skip_special_tokens=True)
         return txt 
-        
+
 
     def forward(self, prompt_text):
         with torch.no_grad():  
             # TODO what does padding and truncation do? remove for now..
-            self.prompt_tokens = self.tokenizer(prompt_text + self.model_tok, return_tensors="pt") #padding=True, truncation=True)
+            self.prompt_tokens = self.tokenizer(prompt_text + self.model_tok, return_tensors="pt", padding=True, truncation=True, add_special_tokens=True) #padding=True, truncation=True)
             IDLs = []
             if self.verbose:
                 print('generating Type 1 response:')
     
-            self.output_tokens = self.current_left_model.generate(
+            self.output_tokens_full = self.current_left_model.generate(
                 self.prompt_tokens.input_ids.to(self.left_model_device),
                 attention_mask=self.prompt_tokens.attention_mask.to(self.left_model_device),
                 max_new_tokens = 100, #self.max_ctx_len - len(prompt_text),
                 #max_length=self.max_ctx_len/2,  # Maximum length of the sequence
                 eos_token_id=self.tokenizer.eos_token_id,  # Stop when the end-of-sequence token is generated
                 num_beams=5,  # Use beam search with 5 beams
-                early_stopping=True,  # Stop early when the beams are sufficiently similar
+                # early_stopping=True,  # Stop early when the beams are sufficiently similar
                 pad_token_id=self.tokenizer.pad_token_id
             )
             
-            num_generated_tokens = self.output_tokens.shape[1] - self.prompt_tokens.input_ids.shape[1]
+            num_generated_tokens = self.output_tokens_full.shape[1] - self.prompt_tokens.input_ids.shape[1]
+            self.output_tokens = self.output_tokens_full[:,-num_generated_tokens:]
             
-            self.output_tokens = self.output_tokens[-num_generated_tokens:]
-            self.last_left_model_response = self._decode(self.output_tokens) #self.tokenizer.decode(self.last_left_model_response.cpu().numpy()[0], skip_special_tokens=True)
+
+            # TODO: DO WE WANT TO ADD MORE "SPACE" FOR THE MODEL TO THINK? ADD PADDING! 
+            if num_generated_tokens < 200 and self.add_thinking_space:
+                size_of_padding = 200 - num_generated_tokens
+
+                # Create a tensor of pad_token_id with the required padding size
+                padding = torch.full((1,size_of_padding), 
+                                     self.tokenizer.pad_token_id, 
+                                     dtype=self.output_tokens.dtype
+                                    ).to(self.output_tokens.device)
+                
+                # Concatenate the original output_tokens with the padding
+                self.output_tokens_full = torch.cat((self.output_tokens_full, padding), dim=-1)
+                self.output_tokens = torch.cat((self.output_tokens, padding), dim=-1)
+                
+                # Update num_generated_tokens
+                num_generated_tokens += size_of_padding
+                
+            if self.decrement_future_negative_logits_with_rewards:
+            
+                # zero_out_bit_flag[i,j] = 1 iff we want to zero out the jth vocab id at the ith token in the seq, 0 otherwise. 
+                # Start with none. Then add 1s to zero_out_bit_flag as we get valence.
+                zero_out_bit_flag = torch.zeros( (self.output_tokens_full.shape[1], len(self.tokenizer) ))
+                
+            
+            else:
+                zero_out_bit_flag = None
+            
+            
+            self.last_left_model_response = self._decode(self.output_tokens) 
+            self.last_left_model_response_full = self._decode(self.output_tokens_full) 
             if self.return_type1_answer:
                 return self.last_left_model_response
-            # self.last_left_model_response = self.last_left_model_response.split(self.model_tok)[-1]
-            # self.last_valence_mask_subset = []
             
             self.last_valence_mask = []
             self.IDL_count = 0
@@ -198,13 +239,11 @@ class SLN:
             if self.verbose:
                 print('Now doing Type 2 thinking to really think about it...')
             
-            # TODO: DO WE WANT TO ADD MORE "SPACE" FOR THE MODEL TO THINK? ADD PADDING! 
-            # size_of_padding = 40
-            # num_generated_tokens = num_generated_tokens + size_of_padding
-            # self.output_tokens = self.output_tokens.extend(self.tokenizer.pad_token_id * size_of_padding)
-            
+
             
             highest_valence = -1.
+
+            
             while True:
                 
                 # inputs = self.tokenizer(input_text, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_ctx_len, add_special_tokens=True)
@@ -216,13 +255,20 @@ class SLN:
     
                 # Forward pass right model
                 self.last_valence_mask = self._forward_right(input_ids, attention_mask)
+
+                if self.decrement_future_negative_logits_with_rewards:
+                    # Update zero_out_bit_flag with 1s where there is 0 valence for specific toks in specific seq positions
+                    
+                    indices_to_update = torch.where(self.last_valence_mask == 0)[0]
+                    zero_out_bit_flag[indices_to_update, input_ids[0,indices_to_update]] = 1
+                
                 one_line = ' '.join(map(str, self.last_valence_mask.tolist()))
 
                 current_valence = int(100.0*sum(self.last_valence_mask) / len(self.last_valence_mask))
                 
                 if self.verbose:
                     # print(f"IDL count {self.IDL_count}: total_valence: {current_valence } IDL: {self.last_left_model_response} per_tok_valence: {one_line}")
-                    print(f"IDL count {self.IDL_count}: total_valence: {current_valence } IDL: {self.last_left_model_response} ")
+                    print(f"IDL count {self.IDL_count}: current_valence: {current_valence } on : {len(self.last_valence_mask) } IDL: {self.last_left_model_response}  ")
                 
                 if current_valence > highest_valence:
                     highest_valence = current_valence
@@ -248,12 +294,16 @@ class SLN:
                 self.last_valence_mask = self.last_valence_mask.to(self.left_model_device)
                 attention_mask = attention_mask.to(self.left_model_device)
                 
-                self.output_tokens = self._forward_left(input_ids, self.last_valence_mask, attention_mask)
-                self.output_tokens = self.output_tokens[-num_generated_tokens:]
+                self.output_tokens_full = self._forward_left(input_ids, self.last_valence_mask, attention_mask, zero_out_bit_flag=zero_out_bit_flag)
+                
+                    
+                self.output_tokens = self.output_tokens_full[:,-num_generated_tokens:]
+                
                 # also, we may find the first padding tok, and eliminate everything after it? 
                 # first_pad_tok_index = torch.nonzero(torch.eq(self.output_tokens, 
                 #                                self.tokenizer.pad_token_id), 
                 #                                as_tuple=True)[1][0].item()
+                
 
 
                 

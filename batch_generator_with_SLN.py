@@ -11,17 +11,17 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import random
 import numpy as np
 import pdb
-import datetime
+
 sys.path.append('.')
 from sln_v2 import SLN
+import glob
 
 # UPDATE THIS TO WHERE YOUR https://github.com/Fchaubard/sentence_augs.git is cloned to:
 sys.path.append(os.path.abspath(os.path.join('..', 'sentence_augs')))
 from text_corrupter import text_corrupter_negative, generate_match_mask
 from timeout_decorator import timeout, TimeoutError
 
-
-# @timeout(60*3)  # Set a timeout of n seconds for this function
+@timeout(60*5)  # Set a timeout of n seconds for this function
 def generate_random_valence_batch(list_of_programs, 
                                  sln,
                                  number_of_programs_to_sample, 
@@ -64,21 +64,26 @@ def generate_random_valence_batch(list_of_programs,
                 # Generate positives:
                 for positive_sample in positive_samples:
 
-                    question = positive_sample['question']
+                    question = positive_sample['question'] + " "+left_model_sep_tok+" "
                     true_answer = positive_sample['answer']
 
                     input_text = question + " "+left_model_sep_tok+" " + true_answer
                     valence_mask = [1 for _ in range(len(sln.tokenizer.tokenize(input_text)))]
 
                     batch.append({'input_text':input_text, 'true_answer':true_answer, 'valence_mask':valence_mask})
+                    
+                    print(f"question: {question}")
+                    
                     all_IDLs = sln.forward(question)
+                    
                     for dd in all_IDLs:
                         
                         IDL_count = dd["IDL_count"]
                         left_model_response = dd["left_model_response"]
                         right_model_valence = dd["right_model_valence"]
 
-                        left_model_input_text = question + " "+left_model_sep_tok+" " +left_model_response
+                        left_model_input_text = question + left_model_response
+                        print(f"left_model_input_text: {left_model_input_text}")
                         
                         valence_mask = generate_match_mask(
                                                             sln.tokenizer, 
@@ -107,12 +112,33 @@ if __name__ == '__main__':
     # Define the gsm8k file path... or if you want, create more programs somewhere else.
     gsm_file_path = '../sentence_augs/gsm8k_train_programs.txt'
     
+    
     batches_directory = "/sln_batches/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
+
+    right_directory = "/right_checkpoints/"
+            
+    left_directory = "/left_checkpoints/"
+    
+    # Get list of all checkpoint files in the directory
+    files = glob.glob(os.path.join(right_directory, "right_checkpoint_*.pth"))
+    
+    # Find the most recent file based on modification time
+    right_model_checkpoint = max(files, key=os.path.getmtime)
+    
+    
+    # Get list of all checkpoint files in the directory
+    files = glob.glob(os.path.join(left_directory, "left_checkpoint_*.pth"))
+    
+    # Find the most recent file based on modification time
+    left_model_checkpoint = max(files, key=os.path.getmtime)
+
+
     number_of_programs_to_sample = 1
     samples_per_program = 1
+    update_left_model_every_n_batches = 300
     
-    left_model_checkpoint = "/left-strange-loop-network-410m/left_checkpoint_20240715173212_iter_800_loss_37.63.pth" #"<path to right model checkpoint>"
-    right_model_checkpoint = "/right-strange-loop-network-410m/right_checkpoint_20240709113005_iter_2000_loss_0.52.pth"
+    # left_model_checkpoint = "/left-strange-loop-network-410m/left_checkpoint_20240715173212_iter_800_loss_37.63.pth" #"<path to right model checkpoint>"
+    # right_model_checkpoint = "/right-strange-loop-network-410m/right_checkpoint_20240709113005_iter_2000_loss_0.52.pth"
     #right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" #"<path to left model checkpoint>"
     
     sln = SLN(right_model_checkpoint, left_model_checkpoint, verbose=False, return_all_IDLs=True)
@@ -146,7 +172,7 @@ if __name__ == '__main__':
     # Strip any leading or trailing whitespace from each program
     list_of_programs = [program.strip() for program in list_of_programs]
     print('# programs: '+str(len(list_of_programs)))
-
+    batches_created_since_last_model_update = 0 
     # Step 4: create some batches and save them off
     while True:
         # Create the batch:
@@ -156,6 +182,7 @@ if __name__ == '__main__':
                                              samples_per_program=samples_per_program)
 
         # Save it to ./batches/batch_<timestamp>_<left_model_checkpoint_name>.pckl 
+        import datetime
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
 
         # Create the filename
@@ -182,3 +209,30 @@ if __name__ == '__main__':
             print(f"true_answer: {true_answer}")
             print(f"valence_mask: {valence_mask}")
             print('='*50)
+
+        # check if we should update our left_model and if so, update current_left_model from most recent checkpoint in left_model_directory
+        batches_created_since_last_model_update+=1
+        
+        if batches_created_since_last_model_update > update_left_model_every_n_batches:
+            batches_created_since_last_model_update = 0
+           
+            
+            # Get list of all checkpoint files in the directory
+            files = glob.glob(os.path.join(right_directory, "right_checkpoint_*.pth"))
+            
+            # Find the most recent file based on modification time
+            right_model_checkpoint = max(files, key=os.path.getmtime)
+            
+            
+            # Get list of all checkpoint files in the directory
+            files = glob.glob(os.path.join(left_directory, "left_checkpoint_*.pth"))
+            
+            # Find the most recent file based on modification time
+            left_model_checkpoint = max(files, key=os.path.getmtime)
+            print("UPDATING to new model checkpoints {right_model_checkpoint} {left_model_checkpoint}")
+            
+            sln = SLN(right_model_checkpoint, left_model_checkpoint, verbose=False, return_all_IDLs=True)
+            
+            print("SUCCESS!")
+
+

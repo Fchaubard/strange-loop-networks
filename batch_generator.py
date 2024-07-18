@@ -157,7 +157,7 @@ if __name__ == '__main__':
     
     left_model_directory = "./left_checkpoints/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
     
-    batches_directory = "./batches/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
+    batches_directory = "/sln_batches/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
     
     pad_tok = '[PAD]'
     left_model_sep_tok = '<left model>'
@@ -225,6 +225,7 @@ if __name__ == '__main__':
                                              left_model_sep_tok=left_model_sep_tok,
                                              samples_per_program=samples_per_program)
 
+        import datetime
         # Save it to ./batches/batch_<timestamp>_<left_model_checkpoint_name>.pckl 
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
 

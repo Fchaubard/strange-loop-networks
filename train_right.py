@@ -40,12 +40,20 @@ if __name__ == '__main__':
 
     # update what model you want to use WARNING: IF YOU WANT TO START FROM A CHECKPOINT OF RIGHT MODEL, THIS IS THE PLACE TO DO IT:
     model_id = "EleutherAI/pythia-410M" #"EleutherAI/pythia-1b" # "EleutherAI/pythia-70m-v0"
-    right_model_checkpoint_name = "/right-strange-loop-network-410m/right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" # use this if you want to load from a checkpoint, else will load from pythia pretrained
+    # right_model_checkpoint_name = "/right-strange-loop-network-410m/right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" # use this if you want to load from a checkpoint, else will load from pythia pretrained
     
     right_model_directory = "/right_checkpoints/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
+
+    # Get list of all checkpoint files in the directory
+    files = glob.glob(os.path.join(right_model_directory, "right_checkpoint_*.pth"))
     
-    macro_batch_size = 1 
+    # Find the most recent file based on modification time
+    right_model_checkpoint_name = max(files, key=os.path.getmtime)
+    
+    macro_batch_size = 10
     pad_tok = '[PAD]'
+
+    max_ctx_len = 3000
 
     # Initialize wandb
     wandb_project_name = "reward_training_pythia_"+model_id.replace("/","_")
@@ -56,12 +64,14 @@ if __name__ == '__main__':
 
     # for scheduler
     factor=0.5
-    patience=200
-    cooldown=200
+    patience=2000
+    cooldown=2000
 
-    max_microbatch_size = 20 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
+    max_microbatch_size = 10 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
 
-    save_checkpoint_every_n_batches = 500
+    save_checkpoint_every_n_batches = 1500
+
+    last_batches_to_sample_from = 500
     
     include_wandb = True
     #------------------
@@ -116,7 +126,7 @@ if __name__ == '__main__':
         reward_layer = reward_layer.to(device)
 
         optimizer_right = optim.AdamW(list(current_right_model.parameters()) + list(reward_layer.parameters()), lr=lr, betas=betas, weight_decay=weight_decay)
-        optimizer_right.load_state_dict(checkpoint['optimizer_state_dict'])
+        # optimizer_right.load_state_dict(checkpoint['optimizer_state_dict'])
     else:
         # load from hf default
         print("STARTING WEIGHTS FROM DEFAULT")
@@ -159,7 +169,7 @@ if __name__ == '__main__':
     print("STARTING TRAINING")
     while True:
         # Load a batch from ./batches/*.json. Grab the top 100 most recent files, and then select randomly one of them.
-        batch_files = sorted(glob.glob(os.path.join(batches_directory, '*.json')), key=os.path.getmtime, reverse=True)[:100]
+        batch_files = sorted(glob.glob(os.path.join(batches_directory, '*.json')), key=os.path.getmtime, reverse=True)[:last_batches_to_sample_from]
         if not batch_files:
             print("No batch files found. Please create some batches.")
             exit()
@@ -172,7 +182,7 @@ if __name__ == '__main__':
         reward_masks = [sample['valence_mask'] for sample in batch]
 
         maxx = max([len(sample['input_text']) for sample in batch])
-        if maxx > 2000:
+        if maxx > max_ctx_len:
            print("MAXXXX LENGTH IS SURPASSED SO SKIPPING, MAXX: " + str(maxx) )
            continue
         inputs = tokenizer(input_texts, return_tensors='pt', padding=True, truncation=True)
@@ -250,14 +260,15 @@ if __name__ == '__main__':
             optimizer_right.zero_grad()
 
             accuracy = total_correct / (input_ids.size(0) * input_ids.size(1))  # Per-token accuracy
-            message = {"right_BCE_loss": round(float(total_loss),2), "right_per_tok_acc": round(float(accuracy),2), "lr": optimizer_right.param_groups[0]['lr'], "norm_grad": round(float(normed_grad),2),"norm_grad_r": round(float(normed_grad_r),2)}
+            message = {"right_BCE_loss": round(float(total_loss),2), "right_per_tok_acc": float(accuracy), "lr": optimizer_right.param_groups[0]['lr'], "norm_grad": round(float(normed_grad),2),"norm_grad_r": round(float(normed_grad_r),2)}
 
             if include_wandb:
                 wandb.log(message)
             print(message)
-        
+            num_batches_since_last_checkpoint += 1
+            
         iterr+=1
-        num_batches_since_last_checkpoint += 1
+        
         
         if num_batches_since_last_checkpoint >= save_checkpoint_every_n_batches:
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")

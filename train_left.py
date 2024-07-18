@@ -64,11 +64,16 @@ if __name__ == '__main__':
 
     # update what model you want to use WARNING: IF YOU WANT TO START FROM A CHECKPOINT OF LEFT MODEL, THIS IS THE PLACE TO DO IT:
     model_id = "EleutherAI/pythia-410M" #"EleutherAI/pythia-1b" #"EleutherAI/pythia-70m-v0"
-    left_model_checkpoint_name = "/left-strange-loop-network-410m/left_checkpoint_20240715173212_iter_800_loss_37.63.pth" # use this if you want to load from a checkpoint, else will load from pythia pretrained
-    
+    # left_model_checkpoint_name = "/left-strange-loop-network-410m/left_checkpoint_20240715173212_iter_800_loss_37.63.pth" # use this if you want to load from a checkpoint, else will load from pythia pretrained
     left_model_directory = "/left_checkpoints/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
+
+    # Get list of all checkpoint files in the directory
+    files = glob.glob(os.path.join(left_model_directory, "left_checkpoint_*.pth"))
     
-    macro_batch_size = 1 
+    # Find the most recent file based on modification time
+    left_model_checkpoint_name = max(files, key=os.path.getmtime)
+    
+    macro_batch_size = 4 
     pad_tok = '[PAD]'
     left_model_tok = '<left model>'
 
@@ -81,18 +86,20 @@ if __name__ == '__main__':
 
     # for scheduler
     factor=0.5
-    patience=500
-    cooldown=500
+    patience=1000
+    cooldown=1000
 
-    max_microbatch_size = 10 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
-    max_ctx_len = 2000 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
+    max_microbatch_size = 8 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
+    max_ctx_len = 3000 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
   
-    save_checkpoint_every_n_batches = 500
+    save_checkpoint_every_n_batches = 1500
 
     # for handling the valence input signal
     valence_input_baseline = 0.5
     valence_input_alpha = 2.
     include_wandb = True
+
+    last_batches_to_sample_from = 500
 
     #------------------
     # DO SETUP:
@@ -133,7 +140,7 @@ if __name__ == '__main__':
         current_left_model.load_state_dict(checkpoint['model_state_dict'])
 
         optimizer_left = optim.AdamW(list(current_left_model.parameters()), lr=lr, betas=betas, weight_decay=weight_decay)
-        optimizer_left.load_state_dict(checkpoint['optimizer_state_dict'])
+        # optimizer_left.load_state_dict(checkpoint['optimizer_state_dict'])
     else:
         # load from hf default
         print("STARTING WEIGHTS FROM DEFAULT")
@@ -165,7 +172,7 @@ if __name__ == '__main__':
     print("STARTING TRAINING")
     while True:
         # Load a batch from ./batches/*.json. Grab the top 100 most recent files, and then select randomly one of them.
-        batch_files = sorted(glob.glob(os.path.join(batches_directory, '*.json')), key=os.path.getmtime, reverse=True)[:100]
+        batch_files = sorted(glob.glob(os.path.join(batches_directory, '*.json')), key=os.path.getmtime, reverse=True)[:last_batches_to_sample_from]
         if not batch_files:
             print("No batch files found. Please create some batches.")
             exit()
@@ -292,9 +299,10 @@ if __name__ == '__main__':
             if include_wandb:
                 wandb.log(message)
             print(message)
+            num_batches_since_last_checkpoint += 1
         
         iterr += 1
-        num_batches_since_last_checkpoint += 1
+        
         
         if num_batches_since_last_checkpoint >= save_checkpoint_every_n_batches:
             timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
