@@ -140,7 +140,7 @@ def generate_random_valence_batch(list_of_programs,
                 continue
     return batch
 
-if __name__ == '__main__':
+def run():
  
     #------------------
     # THINGS TO UPDATE:
@@ -149,13 +149,13 @@ if __name__ == '__main__':
     gsm_file_path = '../sentence_augs/gsm8k_train_programs.txt'
     
     # update what device you want to use
-    device = 'cuda:0'
+    device = 'cuda:1'
 
     # update what model you want to use WARNING: IF YOU WANT TO START FROM A CHECKPOINT OF LEFT MODEL, THIS IS THE PLACE TO DO IT:
-    model_id = "EleutherAI/pythia-70m-v0"
-    update_left_model_every_n_batches = 1000 #None if do not ever update, otherwise put a number of batches.
+    model_id = "EleutherAI/pythia-70m"
+    update_left_model_every_n_batches = 100 #None if do not ever update, otherwise put a number of batches.
     
-    left_model_directory = "./left_checkpoints/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
+    left_model_directory = "/left_checkpoints/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
     
     batches_directory = "/sln_batches/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
     
@@ -164,9 +164,6 @@ if __name__ == '__main__':
     # batch_size = number_of_programs_to_sample * samples_per_program * 2    
     number_of_programs_to_sample = 10 
     samples_per_program = 20 
-    
-    
-    
     
     # Step 1: Check for ./batches/ and if it doesn't exist make the folder.
     # Check if the directory exists
@@ -285,5 +282,18 @@ if __name__ == '__main__':
             #     current_left_model.resize_token_embeddings(len(tokenizer))
 
 
+import multiprocessing
 
+def run_in_parallel(num_runs):
+    with multiprocessing.Pool(processes=num_runs) as pool:  # Adjust the number of processes as needed
+        pool.map(run_instance, range(num_runs))
+
+
+def run_instance(_):
+    run()
+
+
+if __name__ == '__main__':
+    num_runs = 10  # Number of times you want to run the function in parallel
+    run_in_parallel(num_runs)
             
