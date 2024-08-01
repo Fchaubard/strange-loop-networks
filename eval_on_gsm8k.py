@@ -17,7 +17,6 @@ import glob
 dataset = load_dataset('openai/gsm8k', 'main')
 dataset = dataset['test']
 
-# Load the model and tokenizer
 print("Booting consciousness... one sec.. :)")
 
 
@@ -49,9 +48,9 @@ sln = SLN(right_model_checkpoint,
           return_highest_valence=True, 
           return_all_IDLs=False,
           round_valence=True,
-          left_model_device="cuda:0",
-          right_model_device="cuda:1",
-          verbose=False)
+          left_model_device="cuda:2",
+          right_model_device="cuda:2",
+          verbose=True)
 
 def extract_answer(text):
     """Extract the final numeric solution from the model's text output."""
@@ -81,8 +80,8 @@ for i, sample in enumerate(dataset):
         print('got it correct')
         correct += 1
 
-    if (i + 1) % 100 == 0:
-        print(f"Processed {i + 1}/{total} samples, score so far {correct*1.0/i}")
+    if (i + 1) % 1 == 0:
+        print(f"Processed {i + 1}/{total} samples, score so far: {correct*1.0/(i+1)}")
 
 # Report the results
 accuracy = correct / total

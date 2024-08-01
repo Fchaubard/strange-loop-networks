@@ -1,4 +1,8 @@
-# train_left.py 
+# train_left-COT-masking.py 
+# - starts off with no masking, and then once the model hits >X% acc, it will subtract one token. 
+# - INPUT: [PAD] + input_text + <left model> + true_answer[:-n] + [PAD] * n
+# - OUTPUT: [PAD] + input_text + <left model> + true_answer
+
 # - picks up batches from ./batches/*, sorts by time to grab n most recent, and then trains left model on them. 
 # - pushes results to wandb, and saves checkpoints to ./checkpoint_left/ with format 'left_checkpoint_timestamp_iter_loss.h5'
 # - train with either Cross Entropy, Focal Loss, or with policy gradient optimization.. or PPO? or RLOO? or DPO? ... TBD! IMPLEMENT THIS LAST! Just get it working.
@@ -37,13 +41,48 @@ from print_colored_text import print_colored_text
 os.environ["WANDB_API_KEY"] = "cce47709d839921f0b13533529f31c8af7f3f4dc"
 
 
+class ChainOfThoughtMasking:
+    def __init__(self, vocab_size, accuracy_threshold, cooldown, pad_token_id, random_replacement=False):
+        self.vocab_size = vocab_size
+        self.accuracy_threshold = accuracy_threshold
+        self.cooldown = cooldown
+        self.n = 2
+        self.pad_token_id = pad_token_id
+        self.random_replacement = random_replacement
+        self.accuracy_vector = []
+
+    def mask_tokens(self, output_tokens, true_answer_len):
+        input_tokens = output_tokens.clone()
+        
+        if self.n < true_answer_len and self.n > 0:
+            if self.random_replacement:
+                random_tokens = torch.tensor(random.choices(range(self.vocab_size), k=self.n))
+                input_tokens[..., -self.n:] = random_tokens  # Masking the rightmost n tokens
+            else:
+                input_tokens[..., -self.n:] = self.pad_token_id  # Masking the rightmost n tokens
+
+        return input_tokens
+
+    def update_n(self, current_accuracy):
+        self.accuracy_vector.append(current_accuracy)
+        if np.mean(self.accuracy_vector) >= self.accuracy_threshold and len(self.accuracy_vector)>self.cooldown:
+                self.n += 1
+                self.cooldown_counter = 0
+                self.accuracy_vector = []
+    def __call__(self, output_tokens, current_accuracy,true_answer_len):
+        input_tokens = self.mask_tokens(output_tokens,true_answer_len)
+        self.update_n(current_accuracy)
+        return input_tokens
+
+
+
 
 
 # Define the warm-up and cosine decay scheduler
 def lr_lambda(current_step):
-    if current_step < warmup_steps:
-        # Linear warm-up
-        return float(current_step) / float(max(1, warmup_steps))
+    # if current_step < warmup_steps:
+    #     # Linear warm-up
+    #     return float(current_step) / float(max(1, warmup_steps))
     # Cosine decay
     return 0.5 * (1.0 + math.cos(math.pi * (current_step - warmup_steps) / (total_steps - warmup_steps)))
 
@@ -100,15 +139,23 @@ if __name__ == '__main__':
     batches_directory = "/sln_batches/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
     
     # update what device you want to train this model on
-    device = 'cuda:0'#'cpu'#
-
+    device = 'cuda:2'#'cpu'#
+    COT_accuracy_threshold = 0.98  # Example accuracy threshold
+    COT_cooldown = 100  # Example cooldown period
+    random_replacement = False
+    
     # update what model you want to use WARNING: IF YOU WANT TO START FROM A CHECKPOINT OF LEFT MODEL, THIS IS THE PLACE TO DO IT:
     model_id = "EleutherAI/pythia-2.8b" #"EleutherAI/pythia-1b" #"EleutherAI/pythia-70m-v0"
     # left_model_checkpoint_name = "/left-strange-loop-network-410m/left_checkpoint_20240715173212_iter_800_loss_37.63.pth" # use this if you want to load from a checkpoint, else will load from pythia pretrained
-    left_model_directory = "/left_checkpoints/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
+    # left_model_directory = "/left_checkpoints_masking/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
 
+    # # # Get list of all checkpoint files in the directory
+    # files = glob.glob(os.path.join(left_model_directory, "left_checkpoint_masking_*.pth"))
+    # left_model_directory = "/left_checkpoints_masking_random_replacement/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
+    left_model_directory = "/left_checkpoints_masking/" # I WOULD KEEP THIS AS DEFAULT PATTERN FOR SLN TRAINING
+    
     # # Get list of all checkpoint files in the directory
-    files = glob.glob(os.path.join(left_model_directory, "left_checkpoint_*.pth"))
+    files = glob.glob(os.path.join("/left_checkpoints/", "left_checkpoint_*.pth"))
     
     # Find the most recent file based on modification time
     left_model_checkpoint_name = max(files, key=os.path.getmtime)
@@ -147,9 +194,15 @@ if __name__ == '__main__':
 
     decode_every_n_batches = 100
 
+    
+    
+    
+
+
     #------------------
     # DO SETUP:
     #------------------
+
     if include_wandb:
         wandb.init(project=wandb_project_name)
     # Check if the batches_directory exists
@@ -178,13 +231,14 @@ if __name__ == '__main__':
         # tokenizer.add_special_tokens({'bos_token': "<|begoftext|>"})
         print('setting tokenizer.pad_token_id to: ' + str(tokenizer.pad_token_id) + " with token: "+pad_tok)
         # print('setting tokenizer.pad_token_id to: ' + str(tokenizer.bos_token_id) + " with token: "+"<|begoftext|>")
-        
 
+    
+    
     # create initial model 
     if left_model_checkpoint_name:
         print("LOADING MODEL FROM: " +left_model_checkpoint_name)
         # Implement load from a checkpoint
-        checkpoint = torch.load(left_model_checkpoint_name)
+        checkpoint = torch.load(left_model_checkpoint_name,map_location=device)
         current_left_model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
 
         current_left_model.config.pad_token_id = tokenizer.pad_token_id
@@ -200,13 +254,21 @@ if __name__ == '__main__':
     else:
         # load from hf default
         print("STARTING WEIGHTS FROM DEFAULT")
-        current_left_model = AutoModelForCausalLM.from_pretrained(model_id)
+        current_left_model = AutoModelForCausalLM.from_pretrained(model_id).to(device)
         current_left_model.config.pad_token_id = tokenizer.pad_token_id
         current_left_model.resize_token_embeddings(len(tokenizer))
         optimizer_left = optim.AdamW(list(current_left_model.parameters()), lr=lr, betas=betas,weight_decay=weight_decay)
     
     current_left_model = current_left_model.to(device)
     
+    
+    left_model_token_id = tokenizer(left_model_tok,  return_tensors='pt').input_ids[0,-1]
+    COT_masking_func = ChainOfThoughtMasking(current_left_model.config.vocab_size, 
+                                             COT_accuracy_threshold, 
+                                             COT_cooldown, 
+                                             tokenizer.pad_token_id,
+                                             random_replacement=random_replacement)
+
     # scheduler = ReduceLROnPlateau(optimizer_left, mode='min', factor=factor, patience=patience, cooldown=cooldown, threshold=0.0001, threshold_mode='rel',  min_lr=1e-9, eps=1e-08, verbose=True)
     total_steps = 10000  # Example total number of steps
     warmup_steps = 100  # Example number of warm-up steps
@@ -235,6 +297,7 @@ if __name__ == '__main__':
     # Initialize loss for accumulation
     total_loss = 0.0
     total_correct = 0.0
+    accuracy = 0.0
     denom = 0
     print("STARTING TRAINING")
     while True:
@@ -259,40 +322,41 @@ if __name__ == '__main__':
         
                             
         output_texts = []
-        valence_masks = []
-        input_texts = []
+        # valence_masks = []
+        # input_texts = []
+        max_true_answer = []
         for input_text, true_answer in zip(input_texts_original,true_answers):
             split_point = input_text.find(left_model_tok) 
             if split_point==-1:
-                output_target = tokenizer.bos_token  + " "+ input_text + " "+left_model_tok +" "+ true_answer
+                output_target = tokenizer.eos_token  + " " + input_text + " "+left_model_tok +" "+ true_answer + pad_tok
             else:
                 split_point += len(left_model_tok)
-                output_target = tokenizer.bos_token  + " "+ input_text[:split_point] + " " + true_answer
+                output_target = tokenizer.eos_token  + " " + input_text[:split_point] + " " + true_answer + pad_tok
             
             # TODO! clean up case where we have 2 <left_model> tokens.. 
-            input_text = tokenizer.bos_token + " "+ input_text
+            # input_text = tokenizer.eos_token + " "+ input_text + pad_tok
             output_texts.append(output_target)
-            input_texts.append(input_text)
-            valence_masks.append(generate_match_mask(tokenizer,
-                                                   input_text,
-                                                   output_target)
-                                )
+            # input_texts.append(input_text)
+            true_answer_toks_len = tokenizer(true_answer, return_tensors='pt').input_ids.shape[-1]
+            max_true_answer.append(true_answer_toks_len)
+            
+            # valence_masks.append(generate_match_mask(tokenizer,
+            #                                        input_text,
+            #                                        output_target)
+            #                     )
         
 
-        maxx_input = max([len(i) for i in input_texts])
+        # maxx_input = max([len(i) for i in input_texts])
         maxx_output = max([len(o) for o in output_texts])
         
         print('training:'+str(iterr)) 
       
-        if max(maxx_input,maxx_output) > max_ctx_len:
-           print("MAXXXX LENGTH IS SURPASSED SO SKIPPING, maxx_input:" + str(maxx_input) +  " maxx_output:" + str(maxx_output) )
+        if maxx_output > max_ctx_len:
+           print("MAXXXX LENGTH IS SURPASSED SO SKIPPING, maxx_output:" + str(maxx_output) )
            continue
     
-
-
-        
         optimizer_left.zero_grad()
-        batch_size = len(input_texts)
+        batch_size = len(output_texts)
         num_microbatches = (batch_size + max_microbatch_size - 1) // max_microbatch_size
         
         try:
@@ -301,21 +365,29 @@ if __name__ == '__main__':
                     start_idx = i * max_microbatch_size
                     end_idx = min(start_idx + max_microbatch_size, batch_size)
                     
-                    batch_input_text = input_texts[start_idx:end_idx]
                     batch_output_texts = output_texts[start_idx:end_idx]
-                    batch_valence_masks = valence_masks[start_idx:end_idx]
+                    batch_max_true_answer = max(max_true_answer[start_idx:end_idx])
                     
                     
                     outputs = tokenizer(batch_output_texts, return_tensors='pt', padding=True, truncation=True, add_special_tokens=True) #padding='max_length', truncation=True, max_length=max_ctx_len,  add_special_tokens=True) # TODO: MAKE SURE THIS DOES NOT! 
                     maxx = outputs.input_ids.shape[-1]
-
-                    inputs = tokenizer(batch_input_text, return_tensors='pt', padding="max_length", max_length=maxx, truncation=True, add_special_tokens=True) #max_length=max_ctx_len, add_special_tokens=True) # TODO: MAKE SURE THIS INCLUDES BOS token
-            
-                    input_ids = inputs['input_ids'][:,:-1].to(device) #.to(device) # drop the last column
+                    
+                    
+                    inputs = COT_masking_func(outputs.input_ids, accuracy, batch_max_true_answer)
+                    
+ 
+                    # inputs = tokenizer(batch_input_text, return_tensors='pt', padding="max_length", max_length=maxx, truncation=True, add_special_tokens=True) #max_length=max_ctx_len, add_special_tokens=True) # TODO: MAKE SURE THIS INCLUDES BOS token
+                    
+                    input_ids = inputs[:,:-1].to(device) #.to(device) # drop the last column
                     output_ids = outputs['input_ids'][:,1:].to(device) #.to(device) # shift one right  (drop the BOS token)
                     attention_mask = torch.ones_like(input_ids).to(device)
-                    valence_masks_tensors = [torch.tensor(mask) for mask in batch_valence_masks]
+                    # valence_masks_tensors = [torch.tensor(mask) for mask in batch_valence_masks]
+
                     
+                    valence_masks_tensors = (outputs.input_ids.to(device) == inputs.to(device)).int()
+                    
+                    
+
                     valence_masks_tensors_padded = nn.utils.rnn.pad_sequence(valence_masks_tensors, batch_first=True, padding_value=0)
             
                     valence_masks_tensors_padded = valence_masks_tensors_padded[:,:-1] #.to(device)
@@ -335,7 +407,7 @@ if __name__ == '__main__':
                 
                 
                 
-                if iterr % decode_every_n_batches == (decode_every_n_batches-1):
+                if iterr % decode_every_n_batches == 0:
                     output_toks = model_outputs.argmax(dim=-1) # batch x seq (value = tok)
                     for j in range(output_toks.shape[0]):
                         print("-"*5)
@@ -351,7 +423,7 @@ if __name__ == '__main__':
                         print("model_output:",decoded_string)
                         print("-"*5)
                         
-                #pdb.set_trace()
+                # pdb.set_trace()
                 # Calculate binary cross-entropy loss for each token
                 output_ids_flat = output_ids.view(-1).long() # torch.Size([batch, seq]) -> batch*seq x 1
                 model_outputs_flat = model_outputs.view(-1, model_outputs.shape[-1])   # torch.Size([batch, seq, Vocab])  -> batch*seq x 1
@@ -397,7 +469,7 @@ if __name__ == '__main__':
     
                 
                 accuracy = total_correct / denom  # Per-token accuracy.. TODO: This is actually just the last iter.. not the full macro_batch.. need to fix.. too lazy..
-                message = {"iterr":iterr, "left_BCE_loss": round(float(total_loss),5), "left_per_tok_acc": round(float(accuracy),5), "lr": optimizer_left.param_groups[0]['lr'], "norm_grad": round(float(normed_grad),2)}
+                message = {"iterr":iterr, "left_BCE_loss": round(float(total_loss),5), "left_per_tok_acc": round(float(accuracy),5), "lr": optimizer_left.param_groups[0]['lr'], "norm_grad": round(float(normed_grad),2), "COT_masking_n": COT_masking_func.n }
     
                 if include_wandb:
                     wandb.log(message)
@@ -422,7 +494,6 @@ if __name__ == '__main__':
         except Exception as e:
             print("!!!could not fpass" )
             print(e)
-            print(maxx_input,maxx_output, maxx)
             raise Exception(str(e))
             # pdb.set_trace()
             # continue

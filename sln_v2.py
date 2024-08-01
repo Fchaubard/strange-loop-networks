@@ -5,6 +5,11 @@ import torch.nn.functional as F
 from torch.nn.functional import softmax
 import pdb
 
+import sys
+sys.path.append('.')
+from print_colored_text import print_colored_text
+
+
 class SLN:
     def __init__(self, 
                  right_model_checkpoint_name, 
@@ -13,7 +18,7 @@ class SLN:
                  return_type1_answer=False, 
                  return_highest_valence=True, 
                  return_all_IDLs=False,
-                 round_valence=False,
+                 round_valence=True,
                  decrement_future_negative_logits_with_rewards=False,
                  add_thinking_space=False,
                  left_model_device="cuda:0",
@@ -38,7 +43,7 @@ class SLN:
         self.max_ctx_len = 2000
         self.valence_input_baseline = 0.5
         self.valence_input_alpha = 2.
-        self.base_model_id = "EleutherAI/pythia-410M"
+        self.base_model_id = "EleutherAI/pythia-2.8b"
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_id)
         if self.tokenizer.pad_token is None:
@@ -143,14 +148,15 @@ class SLN:
             original_embeddings = current_left_model.get_input_embeddings()
             embeddings = original_embeddings(input_ids)
     
-            token_valences = (token_valences.unsqueeze(-1).float() - baseline) * alpha
-            token_valences = token_valences.expand(-1, embeddings.size(-1))
-            modified_embeddings = embeddings + token_valences
-    
+            token_valences = (token_valences.clone().detach().float() - baseline)*alpha
+            # token_valences = token_valences.expand(-1, -1, embeddings.size(-1))
+            # modified_embeddings = embeddings + token_valences
+            embeddings[:, :, -1] = token_valences
+        
             logits = current_left_model(
-                inputs_embeds=modified_embeddings,
-                attention_mask=attention_mask,
-                return_dict=return_dict
+              inputs_embeds=embeddings,
+              attention_mask=attention_mask,
+              return_dict=return_dict
             ).logits
     
             if not return_dict:
@@ -179,7 +185,7 @@ class SLN:
     def forward(self, prompt_text):
         with torch.no_grad():  
             # TODO what does padding and truncation do? remove for now..
-            self.prompt_tokens = self.tokenizer(prompt_text + self.model_tok, return_tensors="pt", padding=True, truncation=True, add_special_tokens=True) #padding=True, truncation=True)
+            self.prompt_tokens = self.tokenizer(prompt_text + " " + self.model_tok + " ", return_tensors="pt", padding=True, truncation=True, add_special_tokens=True) #padding=True, truncation=True)
             IDLs = []
             if self.verbose:
                 print('generating Type 1 response:')
@@ -194,7 +200,7 @@ class SLN:
                 # early_stopping=True,  # Stop early when the beams are sufficiently similar
                 pad_token_id=self.tokenizer.pad_token_id
             )
-            
+
             num_generated_tokens = self.output_tokens_full.shape[1] - self.prompt_tokens.input_ids.shape[1]
             self.output_tokens = self.output_tokens_full[:,-num_generated_tokens:]
             
@@ -236,9 +242,7 @@ class SLN:
             self.IDL_count = 0
             self.IDL_limit = 10  # This should be set according to your needs
             
-            if self.verbose:
-                print('Now doing Type 2 thinking to really think about it...')
-            
+
 
             
             highest_valence = -1.
@@ -262,13 +266,12 @@ class SLN:
                     indices_to_update = torch.where(self.last_valence_mask == 0)[0]
                     zero_out_bit_flag[indices_to_update, input_ids[0,indices_to_update]] = 1
                 
-                one_line = ' '.join(map(str, self.last_valence_mask.tolist()))
-
                 current_valence = int(100.0*sum(self.last_valence_mask) / len(self.last_valence_mask))
                 
                 if self.verbose:
-                    # print(f"IDL count {self.IDL_count}: total_valence: {current_valence } IDL: {self.last_left_model_response} per_tok_valence: {one_line}")
-                    print(f"IDL count {self.IDL_count}: current_valence: {current_valence } on : {len(self.last_valence_mask) } IDL: {self.last_left_model_response}  ")
+                    print(f"IDL count {self.IDL_count}: current_valence: {current_valence } on : {len(self.last_valence_mask) } IDL: ", end='')
+                    print_colored_text(self.last_valence_mask, input_ids, self.tokenizer)
+                    print("------------------------------------")
                 
                 if current_valence > highest_valence:
                     highest_valence = current_valence
@@ -288,7 +291,9 @@ class SLN:
                     break
                 
                 # score not high enough.. we need to keep trying
-                
+                if self.verbose:
+                    print('Now doing Type 2 thinking to really think about it...')
+            
                 # Forward pass left model and update our output_tokens with the new valence scores
                 input_ids = input_ids.to(self.left_model_device)
                 self.last_valence_mask = self.last_valence_mask.to(self.left_model_device)

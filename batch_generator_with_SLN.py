@@ -64,7 +64,7 @@ def generate_random_valence_batch(list_of_programs,
                 # Generate positives:
                 for positive_sample in positive_samples:
 
-                    question = positive_sample['question'] + " "+left_model_sep_tok+" "
+                    question = positive_sample['question']
                     true_answer = positive_sample['answer']
 
                     input_text = question + " "+left_model_sep_tok+" " + true_answer
@@ -72,7 +72,7 @@ def generate_random_valence_batch(list_of_programs,
 
                     batch.append({'input_text':input_text, 'true_answer':true_answer, 'valence_mask':valence_mask})
                     
-                    print(f"question: {question}")
+                    # print(f"question: {question}")
                     
                     all_IDLs = sln.forward(question)
                     
@@ -82,14 +82,18 @@ def generate_random_valence_batch(list_of_programs,
                         left_model_response = dd["left_model_response"]
                         right_model_valence = dd["right_model_valence"]
 
-                        left_model_input_text = question + left_model_response
-                        print(f"left_model_input_text: {left_model_input_text}")
+                        left_model_input_text =  question + " "+left_model_sep_tok+" " + left_model_response
+                        # print("-"*50)
+                        # print(f"left_model_input_text: {left_model_input_text}")
                         
                         valence_mask = generate_match_mask(
                                                             sln.tokenizer, 
                                                             input_text, 
                                                             left_model_input_text
                                                          )
+                        
+                        # print(f"valence_mask score: {sum(valence_mask)} and shape {len(valence_mask)} = {sum(valence_mask)*1.0/len(valence_mask)} for input_text: { input_text } and left_model_input_text {left_model_input_text}") 
+                        
                         batch.append({'input_text':left_model_input_text, 'true_answer':true_answer, 'valence_mask':valence_mask})
 
                 sampled_programs.append(program)
@@ -133,7 +137,7 @@ if __name__ == '__main__':
     left_model_checkpoint = max(files, key=os.path.getmtime)
 
 
-    number_of_programs_to_sample = 1
+    number_of_programs_to_sample = 17
     samples_per_program = 1
     update_left_model_every_n_batches = 300
     
@@ -141,7 +145,14 @@ if __name__ == '__main__':
     # right_model_checkpoint = "/right-strange-loop-network-410m/right_checkpoint_20240709113005_iter_2000_loss_0.52.pth"
     #right_checkpoint_20240709113005_iter_2000_loss_0.52.pth" #"<path to left model checkpoint>"
     
-    sln = SLN(right_model_checkpoint, left_model_checkpoint, verbose=False, return_all_IDLs=True)
+    sln = SLN(right_model_checkpoint, 
+              left_model_checkpoint, 
+              verbose=True, 
+              return_all_IDLs=True,
+              add_thinking_space=False,
+              left_model_device="cuda:2",
+              right_model_device="cuda:2"
+            )
 
     
     # Step 1: Check for ./batches/ and if it doesn't exist make the folder.
@@ -198,7 +209,7 @@ if __name__ == '__main__':
         print(f"SUCCESS!!!!!! Wrote out file {file_path} of len {len(batch)}")
             
         # randomly output some to monitor whats going on
-        if np.random.rand()>0.0:
+        if np.random.rand()>0.990:
             dd = random.choice(batch)
             input_text =  dd['input_text']
             true_answer =  dd['true_answer']
@@ -213,26 +224,34 @@ if __name__ == '__main__':
         # check if we should update our left_model and if so, update current_left_model from most recent checkpoint in left_model_directory
         batches_created_since_last_model_update+=1
         
-        if batches_created_since_last_model_update > update_left_model_every_n_batches:
-            batches_created_since_last_model_update = 0
+        # if batches_created_since_last_model_update > update_left_model_every_n_batches:
+        #     batches_created_since_last_model_update = 0
            
             
-            # Get list of all checkpoint files in the directory
-            files = glob.glob(os.path.join(right_directory, "right_checkpoint_*.pth"))
+        #     # Get list of all checkpoint files in the directory
+        #     files = glob.glob(os.path.join(right_directory, "right_checkpoint_*.pth"))
             
-            # Find the most recent file based on modification time
-            right_model_checkpoint = max(files, key=os.path.getmtime)
+        #     # Find the most recent file based on modification time
+        #     right_model_checkpoint = max(files, key=os.path.getmtime)
             
             
-            # Get list of all checkpoint files in the directory
-            files = glob.glob(os.path.join(left_directory, "left_checkpoint_*.pth"))
+        #     # Get list of all checkpoint files in the directory
+        #     files = glob.glob(os.path.join(left_directory, "left_checkpoint_*.pth"))
             
-            # Find the most recent file based on modification time
-            left_model_checkpoint = max(files, key=os.path.getmtime)
-            print("UPDATING to new model checkpoints {right_model_checkpoint} {left_model_checkpoint}")
+        #     # Find the most recent file based on modification time
+        #     left_model_checkpoint = max(files, key=os.path.getmtime)
+        #     print("UPDATING to new model checkpoints {right_model_checkpoint} {left_model_checkpoint}")
             
-            sln = SLN(right_model_checkpoint, left_model_checkpoint, verbose=False, return_all_IDLs=True)
+    
+        #     sln = SLN(right_model_checkpoint, 
+        #               left_model_checkpoint, 
+        #               verbose=False, 
+        #               return_all_IDLs=True,
+        #               add_thinking_space=False,
+        #               left_model_device="cuda:2",
+        #               right_model_device="cuda:2"
+        #             )
             
-            print("SUCCESS!")
+        #     print("SUCCESS!")
 
 
