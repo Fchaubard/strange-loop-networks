@@ -22,7 +22,9 @@ class SLN:
                  decrement_future_negative_logits_with_rewards=False,
                  add_thinking_space=False,
                  left_model_device="cuda:0",
-                 right_model_device="cuda:0"
+                 right_model_device="cuda:0",
+                 trajectories_per_IDL=1,
+                 temperature=0.7
                 ):
       with torch.no_grad():  
         self.right_model_checkpoint_name = right_model_checkpoint_name
@@ -43,7 +45,9 @@ class SLN:
         self.max_ctx_len = 2000
         self.valence_input_baseline = 0.5
         self.valence_input_alpha = 2.
-        self.base_model_id = "EleutherAI/pythia-2.8b"
+        self.base_model_id = "EleutherAI/pythia-410m"
+        self.trajectories_per_IDL = trajectories_per_IDL
+        self.temperature = temperature
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_id)
         if self.tokenizer.pad_token is None:
@@ -131,10 +135,24 @@ class SLN:
                 # model_outputs (seq x Vocab), we want to -INF all logits that we know have 0 valence
                 # TODO: Do we want to do float('-inf') or do we want to do something less severe like -1000... hmm..
                 model_outputs = model_outputs.masked_fill(zero_out_bit_flag.bool().to(model_outputs.device), float('-inf'))
+
+            generated_tokens = []
+            for i in range(self.trajectories_per_IDL):
+                # generated_tokens = torch.argmax(model_outputs, dim=-1) # TODO: greedy sampling?? or be smarter..
+                    
+                # Apply softmax to convert logits to probabilities
+                probabilities = torch.softmax(model_outputs / self.temperature, dim=-1)
+                
+                # Sample from the probabilities
+                sampled_tokens = torch.multinomial(probabilities.view(-1, probabilities.size(-1)), 1)
+                
+                # Reshape the sampled tokens to match the original shape
+                sampled_tokens = sampled_tokens.view(probabilities.size()[:-1])
+                
+                generated_tokens.append(sampled_tokens)
             
-            generated_tokens = torch.argmax(model_outputs, dim=-1) # TODO: greedy sampling?? or be smarter..
-            
-            return generated_tokens
+            # Concatenate all the generated tokens along the first dimension
+            return torch.cat(generated_tokens, dim=0)
 
     def _forward_left_with_valence_input(self, 
                                         current_left_model, 
@@ -148,7 +166,7 @@ class SLN:
             original_embeddings = current_left_model.get_input_embeddings()
             embeddings = original_embeddings(input_ids)
     
-            token_valences = (token_valences.clone().detach().float() - baseline)*alpha
+            token_valences = (token_valences.clone().float() - baseline)*alpha
             # token_valences = token_valences.expand(-1, -1, embeddings.size(-1))
             # modified_embeddings = embeddings + token_valences
             embeddings[:, :, -1] = token_valences
@@ -168,7 +186,6 @@ class SLN:
         # return True if we should stop IDL, False if we should not
         if self.IDL_count > self.IDL_limit:
             
-            self.last_left_model_response = self.last_left_model_response + "|||| .... I do not know.. I am not smart enough yet!"
             return False #break out of IDL
         else:
             return True #continue with IDL
@@ -178,14 +195,31 @@ class SLN:
         return True #continue with IDL.. not there yet.. 
         
     def _decode(self, output_tokens):
-        txt = self.tokenizer.decode(output_tokens.cpu().numpy()[0], skip_special_tokens=True)
+        tokens = output_tokens.cpu().numpy()
+        txt = []
+        for i in range(tokens.shape[0]):
+            txt.append(self.tokenizer.decode(output_tokens.cpu().numpy()[i], skip_special_tokens=False))
         return txt 
 
 
     def forward(self, prompt_text):
         with torch.no_grad():  
             # TODO what does padding and truncation do? remove for now..
-            self.prompt_tokens = self.tokenizer(prompt_text + " " + self.model_tok + " ", return_tensors="pt", padding=True, truncation=True, add_special_tokens=True) #padding=True, truncation=True)
+            self.prompt_tokens = self.tokenizer(self.tokenizer.eos_token + " " + prompt_text + " " + self.model_tok + " ", 
+                                    return_tensors="pt", 
+                                    padding=False, 
+                                    truncation=False, 
+                                    add_special_tokens=True)
+            
+            # Check if bos_token_id is not the first token and prepend it if necessary
+            # if self.prompt_tokens.input_ids[0, 0] != self.tokenizer.bos_token_id:
+            #     print("adding bos tok to input_ids")
+            #     bos_token_tensor = torch.tensor([[self.tokenizer.bos_token_id]])
+            #     self.prompt_tokens.input_ids = torch.cat([bos_token_tensor, self.prompt_tokens.input_ids], dim=1)
+            #     self.prompt_tokens.attention_mask = torch.cat([torch.tensor([[1]]), self.prompt_tokens.attention_mask], dim=1)
+            # if self.prompt_tokens.input_ids[0, -1] != self.tokenizer.eos_token_id:
+            #     eos_token_tensor = torch.tensor([[self.tokenizer.eos_token_id]])
+            #     self.prompt_tokens.input_ids = torch.cat([self.prompt_tokens.input_ids,eos_token_tensor], dim=1)
             IDLs = []
             if self.verbose:
                 print('generating Type 1 response:')
@@ -195,12 +229,15 @@ class SLN:
                 attention_mask=self.prompt_tokens.attention_mask.to(self.left_model_device),
                 max_new_tokens = 100, #self.max_ctx_len - len(prompt_text),
                 #max_length=self.max_ctx_len/2,  # Maximum length of the sequence
-                eos_token_id=self.tokenizer.eos_token_id,  # Stop when the end-of-sequence token is generated
+                eos_token_id=-1,#self.tokenizer.eos_token_id,  # Stop when the end-of-sequence token is generated
                 num_beams=5,  # Use beam search with 5 beams
                 # early_stopping=True,  # Stop early when the beams are sufficiently similar
-                pad_token_id=self.tokenizer.pad_token_id
+                pad_token_id=self.tokenizer.pad_token_id,
+                do_sample=True,  # Enable sampling
+                temperature=0.7,  # Control the randomness of sampling
+                num_return_sequences=self.trajectories_per_IDL  # Number of samples to generate
             )
-
+            
             num_generated_tokens = self.output_tokens_full.shape[1] - self.prompt_tokens.input_ids.shape[1]
             self.output_tokens = self.output_tokens_full[:,-num_generated_tokens:]
             
@@ -242,49 +279,56 @@ class SLN:
             self.IDL_count = 0
             self.IDL_limit = 10  # This should be set according to your needs
             
-
-
-            
             highest_valence = -1.
 
-            
             while True:
                 
                 # inputs = self.tokenizer(input_text, return_tensors='pt', padding='max_length', truncation=True, max_length=self.max_ctx_len, add_special_tokens=True)
                 # input_ids = inputs['input_ids']
+                sample_tracker = []
+               
+                for i in range(self.trajectories_per_IDL):
+                    input_ids = torch.cat([self.prompt_tokens.input_ids.to(self.right_model_device), self.output_tokens[i,:].unsqueeze(0).to(self.right_model_device)], dim=-1)
                     
-                input_ids = torch.cat([self.prompt_tokens.input_ids.to(self.right_model_device), self.output_tokens.to(self.right_model_device)], dim=-1)
-                
-                attention_mask = torch.ones_like(input_ids).to(self.right_model_device)
+                    attention_mask = torch.ones_like(input_ids).to(self.right_model_device)
+        
+                    # Forward pass right model
+                    self.last_valence_mask = self._forward_right(input_ids, attention_mask)
     
-                # Forward pass right model
-                self.last_valence_mask = self._forward_right(input_ids, attention_mask)
-
-                if self.decrement_future_negative_logits_with_rewards:
-                    # Update zero_out_bit_flag with 1s where there is 0 valence for specific toks in specific seq positions
+                    if self.decrement_future_negative_logits_with_rewards:
+                        # Update zero_out_bit_flag with 1s where there is 0 valence for specific toks in specific seq positions
+                        
+                        indices_to_update = torch.where(self.last_valence_mask == 0)[0]
+                        zero_out_bit_flag[indices_to_update, input_ids[0,indices_to_update]] = 1
                     
-                    indices_to_update = torch.where(self.last_valence_mask == 0)[0]
-                    zero_out_bit_flag[indices_to_update, input_ids[0,indices_to_update]] = 1
-                
-                current_valence = int(100.0*sum(self.last_valence_mask) / len(self.last_valence_mask))
-                
+                    current_valence = int(100.0*sum(self.last_valence_mask) / len(self.last_valence_mask))
+                    sample_tracker.append((current_valence,input_ids,self.last_valence_mask))
                 if self.verbose:
-                    print(f"IDL count {self.IDL_count}: current_valence: {current_valence } on : {len(self.last_valence_mask) } IDL: ", end='')
-                    print_colored_text(self.last_valence_mask, input_ids, self.tokenizer)
-                    print("------------------------------------")
+                    for current_valence, input_ids, last_valence_mask in sample_tracker:
+                        print(f"IDL count {self.IDL_count}: current_valence: {current_valence } on : {len(last_valence_mask) } IDL: ", end='')
+                        print_colored_text(last_valence_mask, input_ids, self.tokenizer)
+                        print("------------------------------------")
                 
-                if current_valence > highest_valence:
-                    highest_valence = current_valence
-                    highest_valence_response = self.last_left_model_response
-
+                current_valence, input_ids, last_valence_mask = max(sample_tracker, key = lambda x: x[0])
+                
+                best_left_model_response_for_this_IDL = self._decode(input_ids)[0]
+                
                 if self.return_all_IDLs:
+                    # we only return the best sample per IDL
                     IDLs.append( ( {
                                     "IDL_count": self.IDL_count,
-                                    "left_model_response": self.last_left_model_response,
-                                    "right_model_valence": self.last_valence_mask
+                                    "left_model_response": best_left_model_response_for_this_IDL,
+                                    "right_model_valence": last_valence_mask
                                    }
                                  )
                                )
+                
+                if current_valence > highest_valence:
+                    highest_valence = current_valence
+                    self.highest_valence_response = best_left_model_response_for_this_IDL
+                    best_input_ids = input_ids
+
+                
                 
                 if not self._stopping_criteria():
                     # score is high enough or we have hit our limit
@@ -296,8 +340,9 @@ class SLN:
             
                 # Forward pass left model and update our output_tokens with the new valence scores
                 input_ids = input_ids.to(self.left_model_device)
-                self.last_valence_mask = self.last_valence_mask.to(self.left_model_device)
+                self.last_valence_mask = last_valence_mask.to(self.left_model_device)
                 attention_mask = attention_mask.to(self.left_model_device)
+
                 
                 self.output_tokens_full = self._forward_left(input_ids, self.last_valence_mask, attention_mask, zero_out_bit_flag=zero_out_bit_flag)
                 
@@ -309,12 +354,14 @@ class SLN:
                 #                                self.tokenizer.pad_token_id), 
                 #                                as_tuple=True)[1][0].item()
                 
-
-
                 
                 #TODO: CHECK IF WE HAVE TO REMOVE [0] or not.
-                self.last_left_model_response = self.tokenizer.decode(self.output_tokens[0], skip_special_tokens=True)
-    
+                
+                # self.last_left_model_response = self.tokenizer.decode(self.output_tokens[0], skip_special_tokens=True)
+                
+                self.last_left_model_response = self._decode(self.output_tokens) 
+                self.last_left_model_response_full = self._decode(self.output_tokens_full) 
+            
                 #             response_parts = self.last_left_model_response.split(self.model_tok)
                 #             if len(response_parts) > 1:
                 #                 self.last_left_model_response = response_parts[-1]
@@ -325,10 +372,10 @@ class SLN:
                 self.IDL_count += 1
 
             if self.return_highest_valence:
-                self.last_left_model_response = highest_valence_response
+                return self.highest_valence_response
             if self.return_all_IDLs:
                 return IDLs
-            return self.last_left_model_response
+            return best_left_model_response_for_this_IDL
 
 
 if __name__ == "__main__":
@@ -341,7 +388,8 @@ if __name__ == "__main__":
     sln = SLN(right_model_checkpoint, left_model_checkpoint)
   
     prompt_text = "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?"
-    target_response = "Let's break this down step by step.\n\n**Step 1: Understand the problem**\nNatalia sold clips to 48 friends in April. Then, she sold half as many clips in May. We need to find the total number of clips she sold in April and May.\n\n**Step 2: Calculate the number of clips sold in May**\nIf Natalia sold half as many clips in May as she did in April, that means she sold:\n\n48 (clips sold in April) / 2 = 24 clips in May\n\n**Step 3: Add the number of clips sold in April and May**\nTo find the total number of clips sold, we add the number of clips sold in April and May:\n\n48 (clips sold in April) + 24 (clips sold in May) = 72\n\n**Conclusion**\nNatalia sold a total of 72 clips in April and May. "
+    
+    target_response = "Let's break this down step by step.\n\n**Step 1: Understand the problem**\nNatalia sold clips to 48 friends in April. Then, she sold half as many clips in May. We need to find the total number of clips she sold in April and May.\n\n**Step 2: Calculate the number of clips sold in May**\nIf Natalia sold half as many clips in May as she did in April, that means she sold:\n\n48 (clips sold in April) / 2 = 24 clips in May\n\n**Step 3: Add the number of clips sold in April and May**\nTo find the total number of clips sold, we add the number of clips sold in April and May:\n\n48 (clips sold in April) + 24 (clips sold in May) = 72\n\n**Conclusion**\nNatalia sold a total of 72 clips in April and May. #### 72"
 
     model_response = sln.forward(prompt_text)
     
