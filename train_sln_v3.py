@@ -22,9 +22,7 @@ from torch.optim.lr_scheduler import LambdaLR
 import math
 from datasets import load_dataset
 from types import SimpleNamespace
-with concurrent.futures.ThreadPoolExecutor() as executor:
-
-
+import concurrent
 import wandb
 import os
 sys.path.append('.')
@@ -32,7 +30,7 @@ sys.path.append(os.path.abspath(os.path.join('..', 'sentence_augs')))
 from text_corrupter import text_corrupter_negative, generate_match_mask
 
 from print_colored_text import print_colored_text
-
+from sln_v3 import SLN
 
 os.environ["WANDB_API_KEY"] = "cce47709d839921f0b13533529f31c8af7f3f4dc"
 
@@ -82,7 +80,7 @@ if __name__ == '__main__':
     #########
     
     train_configs = {}
-    train_configs["lr"] = 1e-5 
+    train_configs["lr"] = 1e-4
     train_configs["weight_decay"] = 0.0001
     train_configs["betas"] = (0.99,0.999)
 
@@ -102,7 +100,7 @@ if __name__ == '__main__':
     train_configs["valence_input_alpha"] = 2.
     train_configs["reset_lr"] = True
 
-    train_configs["model_id"] = "EleutherAI/pythia-2.8b" 
+    train_configs["model_id"] = "EleutherAI/pythia-12b" 
     wandb_project_name = "sln_training_pythia_"+train_configs["model_id"].replace("/","_")
 
     train_configs["start_from_raw"] = True # do not start from most recent checkpoints
@@ -112,10 +110,16 @@ if __name__ == '__main__':
     train_configs["ptm_accuracy_threshold"] = 0.98  # Example accuracy threshold
     train_configs["ptm_cooldown"] = 100  # Example cooldown period
     train_configs["ptm_random_replacement"] = False
+    train_configs['macro_batch_size'] = 5
 
+    train_configs['total_steps'] = 10000
+    train_configs['warmup_steps'] = 100
+
+    train_configs["checkpoint_every_n_iterrs"] = 1000
+    
     decode_every_n_batches = 100
     include_wandb = True
-    last_batches_to_sample_from = -1    
+
     left_model_directory = "/left_checkpoints/" 
     right_model_directory = "/right_checkpoints/" 
 
@@ -123,7 +127,7 @@ if __name__ == '__main__':
     #########
     # SLN SETUP
     #########
-    
+    train_configs = SimpleNamespace(**train_configs)
     num_gpus = torch.cuda.device_count()
     
     if num_gpus<=4:
@@ -136,7 +140,7 @@ if __name__ == '__main__':
     right_model_checkpoint_name = None
     
     # - load from checkpoint if not from raw
-    if not train_configs["start_from_raw"]:
+    if not train_configs.start_from_raw:
         files = glob.glob(os.path.join(left_model_directory, "left_checkpoint_*.pth"))
         if len(files)==0:
             raise(f"No files in {left_model_directory}")
@@ -149,37 +153,28 @@ if __name__ == '__main__':
 
         right_model_checkpoint_name = max(files, key=os.path.getmtime)
 
-    sln = SLN(train_configs["model_id"],
+    sln = SLN(train_configs.model_id,
          left_model_device_list,
          right_model_device_list,
          left_model_checkpoint_name=left_model_checkpoint_name, 
          right_model_checkpoint_name=right_model_checkpoint_name, 
-         verbose=True, 
-         return_type1_answer=False, 
-         return_highest_valence=True, 
-         return_all_IDLs=False,
-         round_valence=True,
-         decrement_future_negative_logits_with_rewards=False,
-         add_thinking_space=False,
-         trajectories_per_IDL=trajectories_per_IDL,
-         temperature=temperature,
+         verbose=False, 
+         trajectories_per_IDL=train_configs.trajectories_per_IDL,
+         temperature=train_configs.temperature,
          train_configs = train_configs
         )
     
     #------------------
     # DO ENVIRONMENT SETUP:
     #------------------
-    train_configs = SimpleNamespace(**train_configs)
+    
     
     ptm_masking_scheduler = ProgressiveTailMasking(sln.tokenizer.vocab_size, 
-                                         train_config.ptm_accuracy_threshold, 
-                                         train_config.ptm_cooldown, 
+                                         train_configs.ptm_accuracy_threshold, 
+                                         train_configs.ptm_cooldown, 
                                          sln.tokenizer.pad_token_id,
-                                         random_replacement=train_config.ptm_random_replacement)
+                                         random_replacement=train_configs.ptm_random_replacement)
 
-    
-    if include_wandb:
-        wandb.init(project=wandb_project_name)
 
     # Check if the left_model_directory exists
     if not os.path.exists(left_model_directory):
@@ -198,22 +193,30 @@ if __name__ == '__main__':
     else:
         print(f"Directory {right_model_directory} exists.")
     
+    if include_wandb:
+        wandb.init(project=wandb_project_name)
+
+    print("Training with configs:")
+    print(train_configs)
+
+    dataset = load_dataset("openai/gsm8k", "main", split="train")
+    dataset_size = len(dataset)
+    
+    iterr=0
+    accuracy = 0.0
+    
     ####################
     # Start Training!
     ####################
-    dataset = load_dataset("openai/gsm8k", "main", split="train")
-    dataset_size = len(dataset)
-    num_batches_since_last_checkpoint = 0
-    iterr=0
-    # Initialize loss for accumulation
-    accuracy = 0.0
     print("STARTING TRAINING")
+    
     while True:
         # load a prompt and target from the dataset
         sample = dataset[iterr%dataset_size]
-        
-        prompt = sln.special_tokens["bos_token"] + sample["question"]
-        target_response = sln.special_tokens["left_model_token"] + sample["answer"] + sln.special_tokens["eos_token"]
+        sample = dataset[0]
+
+        prompt = sln.special_tokens_dict["bos_token"] + sample["question"]
+        target_response = sln.left_model_token + sample["answer"] + sln.special_tokens_dict["eos_token"]
         
         full_target = prompt + target_response
 
@@ -237,8 +240,9 @@ if __name__ == '__main__':
 
         # fpass the sln, and get back all IDLs. Keep it in token form so we can easily calc loss
         IDL_ids = sln.forward(progressive_tail_masked_input_ids)
-
+        
         target_valences = (progressive_tail_masked_input_ids == full_target_ids).int()
+        
         
         left_loss, left_perplexity, left_accuracy = sln.learn_left(IDL_ids, full_target_ids)
         right_loss, right_classification_accuracy = sln.learn_right(IDL_ids, target_valences)
@@ -259,7 +263,7 @@ if __name__ == '__main__':
         # left_loss, left_perplexity, left_accuracy = left_result
         # right_loss, right_classification_accuracy = right_result
 
-        if iterr % 5:
+        if iterr % train_configs.macro_batch_size:
             normed_grad_left = sln.update_weights_left(left_loss)
             normed_grad_right = sln.update_weights_right(right_loss)
                     
@@ -275,12 +279,17 @@ if __name__ == '__main__':
                    "right_lr": sln.optimizer_right.param_groups[0]['lr'],  
                    "right_normed_grad": round(float(normed_grad_right),5),
                    "ptm_masking_scheduler_n": ptm_masking_scheduler.n }
-    
+
+            print(message)
+            
             if include_wandb:
                 wandb.log(message)
-        
-        if iterr > 1000:
-            sln.save_checkpoints(iterr,left_loss,right_loss)
+            
+            
+            
+        if iterr % train_configs.checkpoint_every_n_iterrs == 0:
+            sln.save_checkpoints(iterr,left_loss,right_loss, left_model_directory, right_model_directory)
+        iterr+=1
 
 
 

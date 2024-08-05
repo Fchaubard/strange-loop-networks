@@ -32,13 +32,6 @@ import os
 sys.path.append('.')
 from print_colored_text import print_colored_text
 
-# Define the warm-up and cosine decay scheduler
-def lr_lambda(current_step):
-    if current_step < warmup_steps:
-        # Linear warm-up
-        return float(current_step) / float(max(1, warmup_steps))
-    # Cosine decay
-    return 0.5 * (1.0 + math.cos(math.pi * (current_step - warmup_steps) / (total_steps - warmup_steps)))
 
 
 def split_model_across_gpus(model, gpu_list):
@@ -63,6 +56,8 @@ def split_model_across_gpus(model, gpu_list):
     device_map["final_layer_norm"] = gpu_list[-1]
     device_map["embed_out"] = gpu_list[-1]
     torch.cuda.empty_cache()
+    print(device_map)
+    
     return device_map
         
 def generate_match_mask(tokenizer, string_true, string_corrupted):
@@ -87,7 +82,7 @@ def print_colored_text(valence_mask, token_ids, tokenizer):
     RED = "\033[31m"
     GREEN = "\033[32m"
     RESET = "\033[0m"  # Reset to default color
-    for valence, token_id in zip(valence_mask, token_ids[0]):
+    for valence, token_id in zip(valence_mask, token_ids):
         # Decode the token ID
         token = tokenizer.decode(token_id)
         
@@ -116,6 +111,7 @@ class SLN:
                  decrement_future_negative_logits_with_rewards=False,
                  add_thinking_space=False,
                  trajectories_per_IDL=3,
+                 IDL_limit = 3,
                  temperature=0.7,
                  train_configs=None
                 ):
@@ -139,32 +135,38 @@ class SLN:
         self.valence_threshold = 0.97
         self.base_model_id = base_model_id
         self.trajectories_per_IDL = trajectories_per_IDL
+        self.IDL_limit = IDL_limit
         self.temperature = temperature
         self.train_configs = train_configs
 
         
-        if train_configs: # just for simplicity.. 
-            train_configs = SimpleNamespace(**train_configs)
 
         
         ####################
         # Setup Tokenizer
         ####################
+        self.left_model_token =  "<left_model>"
+        self.right_model_token =  "<right_model>"
+        
         self.special_tokens_dict = {
             "bos_token": "<bos>",
             "eos_token": "<eos>",
             "pad_token": "<pad>",
             "sep_token": "<sep>",
-            "left_model_token": "<left>",
-            "right_model_token": "<right>",
-            "mask_token": "<mask>"
+            "mask_token": "<mask>",
+            "additional_special_tokens": 
+            [
+                self.left_model_token, 
+                self.right_model_token
+            ]
         }
+        
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_id)
         self.tokenizer.add_special_tokens(self.special_tokens_dict)
         self.tokenizer.padding_side = 'right'
         self.tokenizer.truncation_side = 'right'
-        vocab_size = self.tokenizer.vocab_size
+        # vocab_size = self.tokenizer.vocab_size
         
         ####################
         # Setup left model
@@ -205,12 +207,12 @@ class SLN:
             # Implement load from a checkpoint
             checkpoint = torch.load(self.right_model_checkpoint_name)
             self.current_right_model = AutoModelForCausalLM.from_pretrained(self.base_model_id)
-            self.current_right_model.resize_token_embeddings(len(tokenizer))
+            self.current_right_model.resize_token_embeddings(len(self.tokenizer))
             self.current_right_model.load_state_dict(checkpoint['model_state_dict'])
             
             self.valence_layer = nn.Sequential(
-                nn.LayerNorm(vocab_size, self.current_right_model.config.layer_norm_eps),
-                nn.Linear(vocab_size, 2),
+                nn.LayerNorm(len(self.tokenizer), self.current_right_model.config.layer_norm_eps),
+                nn.Linear(len(self.tokenizer), 2),
                 nn.Softmax(dim=-1)
             )
             
@@ -229,8 +231,8 @@ class SLN:
             self.current_right_model = AutoModelForCausalLM.from_pretrained(self.base_model_id)
             self.current_right_model.resize_token_embeddings(len(self.tokenizer))
             self.valence_layer = nn.Sequential(
-                nn.LayerNorm(vocab_size, self.current_right_model.config.layer_norm_eps),
-                nn.Linear(vocab_size, 2),
+                nn.LayerNorm(len(self.tokenizer), self.current_right_model.config.layer_norm_eps),
+                nn.Linear(len(self.tokenizer), 2),
                 nn.Softmax(dim=-1)
             )
             
@@ -244,6 +246,15 @@ class SLN:
         if train_configs:
             self.optimizer_left.zero_grad()
             self.optimizer_right.zero_grad()
+            # Define the warm-up and cosine decay scheduler
+            def lr_lambda(current_step, warmup_steps=train_configs.warmup_steps, total_steps=train_configs.total_steps):
+                if current_step < warmup_steps:
+                    # Linear warm-up
+                    return float(current_step) / float(max(1, warmup_steps))
+                # Cosine decay
+                return 0.5 * (1.0 + math.cos(math.pi * (current_step - warmup_steps) / (total_steps - warmup_steps)))
+
+
             self.left_scheduler = LambdaLR(self.optimizer_left, lr_lambda)
             self.right_scheduler = LambdaLR(self.optimizer_right, lr_lambda)
             torch.cuda.empty_cache()
@@ -252,26 +263,33 @@ class SLN:
     
 
 
-    def _forward_model_multigpu(self,model, embeddings, attention_mask, device_map):
+    def _forward_model_multigpu(self, model, embeddings, attention_mask, device_map):
+
+        try:
+            hidden_states = embeddings.clone()
+            
+            if attention_mask.dim() == 2:
+                    # Assuming attention_mask shape is [batch_size, seq_len]
+                    attention_mask = attention_mask[:, None, None, :]  # Convert to [batch_size, 1, 1, seq_len]
+                
+            # Pass through each layer manually
+            for i, layer in enumerate(model.gpt_neox.layers):
+                hidden_states = hidden_states.to(device_map[i])
+                attention_mask = attention_mask.to(device_map[i])
+                hidden_states = layer(hidden_states, attention_mask)[0]
         
-        hidden_states = embeddings.clone()
-        
-        # Pass through each layer manually
-        for i, layer in enumerate(model.gpt_neox.layers):
-            current_gpu = device_map[i] #i // layers_per_gpu if i < layers_per_gpu * (num_gpus - 1) else num_gpus - 1
-            hidden_states = hidden_states.to(device_map[current_gpu])
-            attention_mask = attention_mask.to(device_map[current_gpu])
-            hidden_states = layer(hidden_states, attention_mask)[0]
-    
-        hidden_states = model.gpt_neox.final_layer_norm(hidden_states.to(device_map["final_layer_norm"])
-        logits = model.embed_out(hidden_states.device_map["embed_out"])
+            hidden_states = model.gpt_neox.final_layer_norm(hidden_states.to(device_map["final_layer_norm"]))
+            logits = model.embed_out(hidden_states.to(device_map["embed_out"]))
+        except Exception as e:
+            print(e)
+            pdb.set_trace()
         return logits
 
     
     def _forward_right(self, input_ids, attention_mask, round=False):
         input_ids = input_ids.to(self.right_device_map["embed_in"])
         attention_mask = attention_mask.to(self.right_device_map["embed_in"])
-        embeddings = model.gpt_neox.embed_in(input_ids)
+        embeddings = self.current_right_model.gpt_neox.embed_in(input_ids)
         logits = self._forward_model_multigpu(self.current_right_model, embeddings, attention_mask, self.right_device_map)
         # logits = self.current_right_model(input_ids, attention_mask=attention_mask, return_dict=True).logits
         outputs = self.valence_layer(logits.to(self.right_device_map["valence_layer"])) # which is batch x seq x 2 (the second channel is the positive valence )
@@ -302,27 +320,27 @@ class SLN:
         return logits
 
 
-        def _generate_samples_from_logits(self, logits):
-    
-            generated_tokens = []
-            
-            # we will generate self.trajectories_per_IDL samples 
-            for i in range(self.trajectories_per_IDL):
-                # generated_tokens = torch.argmax(model_outputs, dim=-1) # TODO: greedy sampling?? or be smarter..
-                    
-                # Apply softmax to convert logits to probabilities
-                probabilities = torch.softmax(logits / self.temperature, dim=-1)
-                    
-                # Sample from the probabilities
-                sampled_tokens = torch.multinomial(probabilities.view(-1, probabilities.size(-1)), 1)
+    def _generate_samples_from_logits(self, logits):
+
+        generated_tokens = []
+        
+        # we will generate self.trajectories_per_IDL samples 
+        for i in range(self.trajectories_per_IDL):
+            # generated_tokens = torch.argmax(model_outputs, dim=-1) # TODO: greedy sampling?? or be smarter..
                 
-                # Reshape the sampled tokens to match the original shape
-                sampled_tokens = sampled_tokens.view(probabilities.size()[:-1])
+            # Apply softmax to convert logits to probabilities
+            probabilities = torch.softmax(logits / self.temperature, dim=-1)
                 
-                generated_tokens.append(sampled_tokens)
+            # Sample from the probabilities
+            sampled_tokens = torch.multinomial(probabilities.view(-1, probabilities.size(-1)), 1)
             
-            # Concatenate all the generated tokens along the first dimension
-            return torch.cat(generated_tokens, dim=0)
+            # Reshape the sampled tokens to match the original shape
+            sampled_tokens = sampled_tokens.view(probabilities.size()[:-1])
+            
+            generated_tokens.append(sampled_tokens)
+        
+        # Concatenate all the generated tokens along the first dimension
+        return torch.cat(generated_tokens, dim=0)
 
     def _forward_left_with_valence_input(self, 
                                         current_left_model, 
@@ -333,8 +351,10 @@ class SLN:
                                         baseline=0.5):
         
         original_embeddings = current_left_model.get_input_embeddings()
+        
         embeddings = original_embeddings(input_ids.to(self.left_device_map["embed_in"]))
 
+    
         token_valences = (token_valences.clone().float() - baseline)*alpha
         # token_valences = token_valences.expand(-1, -1, embeddings.size(-1))
         # modified_embeddings = embeddings + token_valences
@@ -346,6 +366,7 @@ class SLN:
                         attention_mask,
                         self.left_device_map
                         )
+
         
         return logits
 
@@ -355,7 +376,7 @@ class SLN:
             print("hit IDL_count limit, stopping..")
             return False #break out of IDL
         else:
-            average_valence = 1.0*sum(valence) / len(valence)
+            average_valence = torch.mean(valence)
             assert average_valence <=1 and average_valence >= 0
             if average_valence >= self.valence_threshold: # meaning mostly 1s valence in the left response. 
                 
@@ -375,7 +396,7 @@ class SLN:
 
     def forward(self, input_token_ids):
 
-        pdb.set_trace()
+        
         generated_samples = input_token_ids
         attention_mask = torch.ones_like(generated_samples).to(self.right_model_device_list[0])
         
@@ -384,30 +405,32 @@ class SLN:
     
         while True:
             
-            IDL_ids[IDL_iterr] = {}
+            IDL_ids[IDL_iterr] = []
             # Forward pass right model on all samples (initially will be just the input)
             valence_mask = self._forward_right(generated_samples, attention_mask)[:,:,1]
             
             for i in range(valence_mask.shape[0]):
                 
                 total_valence = torch.sum(valence_mask[i,...]).item() 
-                sample = generated_samples[i,...].clone().detach()
-                IDL_ids[IDL_iterr][i] = {"valence_mask":valence_mask[i,...].clone().detach(),
-                                        "IDL_ids":sample,
-                                        "IDL_string":sln.tokenizer._decode(sample),
+                sample = generated_samples[i,...]
+                
+                IDL_ids[IDL_iterr].append( {"valence_mask":valence_mask[i,...].unsqueeze(0),
+                                        "IDL_ids":sample.unsqueeze(0),
+                                        "IDL_string":self.tokenizer._decode(sample.tolist()),
                                         "total_valence":total_valence
-                                        }
+                                        })
                                         
                 if self.verbose:
                     print(f"IDL count {IDL_iterr}, sample count {i}: total_valence: {total_valence} on : { valence_mask.shape[-1] } IDL: ", end='')
-                    print_colored_text(valence_mask[i,...], sample, self.tokenizer)
+                    print_colored_text(valence_mask[i,...], sample.tolist(), self.tokenizer)
                     print("------------------------------------")
 
             # find best valence trajectory so far, and continue on from there
+            
             best_sample = max(IDL_ids[IDL_iterr], key = lambda x: x["total_valence"])
             
-            best_valence_mask = best_sample["valence_mask"]
-            best_IDL_ids = best_sample["IDL_ids"]
+            best_valence_mask = best_sample["valence_mask"] #tensor
+            best_IDL_ids = best_sample["IDL_ids"]  #tensor
             best_IDL_string = best_sample["IDL_string"]
             best_total_valence = best_sample["total_valence"]
             
@@ -415,10 +438,6 @@ class SLN:
                 # score is high enough or we have hit our limit
                 break
             
-            # score not high enough.. we need to keep trying
-            if self.verbose:
-                print('Now doing Type 2 thinking to really think about it...')
-        
             # Forward pass left model and generate samples from them
             logits = self._forward_left(best_IDL_ids, best_valence_mask, attention_mask, zero_out_bit_flag=None)
             generated_samples = self._generate_samples_from_logits(logits)
@@ -429,26 +448,31 @@ class SLN:
 
     def learn_left(self, IDL_ids, target_ids): 
 
-        IDL_ids = torch.cat([d["IDL_ids"].to(self.left_device_map["embed_in"]) for sub_dict in IDL_ids.values() for d in sub_dict])
-        valence_masks = torch.cat([d["valence_mask"].to(self.left_device_map["embed_in"]) for sub_dict in IDL_ids.values() for d in sub_dict])
-        attention_mask = torch.ones_like(IDL_ids).to(self.left_device_map["embed_in"])
-
+        input_ids = torch.cat([d["IDL_ids"].to(self.left_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
+        valence_masks = torch.cat([d["valence_mask"].to(self.left_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
+        attention_mask = torch.ones_like(input_ids).to(self.left_device_map["embed_in"])
+        
         # fpass the model on all IDLs
-        logits = self._forward_left(IDL_ids, valence_masks, attention_mask, zero_out_bit_flag=None)
+        logits = self._forward_left(input_ids, valence_masks, attention_mask, zero_out_bit_flag=None)
 
-        assert IDL_ids.shape[-1] == target_ids[-1]
+        assert input_ids.shape[-1] == target_ids.shape[-1]
         
         # Right shift the targets for autoregressive prediction
         
-        batch, seq_len, vocab_size = logits.shape
+        batch_size, seq_len, vocab_size = logits.shape
         target_ids = target_ids.expand(batch_size, -1)
-
-        shifted_targets = torch.zeros_like(IDL_ids)
-        shifted_targets[..., :-1] = target_ids[..., 1:]
-        shifted_targets[..., -1] = tokenizer.eos_token_id
         
-        # Compute the loss
+
+        shifted_targets = torch.zeros_like(input_ids)
+        shifted_targets[..., :-1] = target_ids[..., 1:]
+        shifted_targets[..., -1] = self.tokenizer.eos_token_id
+        shifted_targets = shifted_targets.to(self.left_device_map["embed_out"])
+        
+        # Compute CE loss 
+        criterion = nn.CrossEntropyLoss()
         loss = criterion(logits.view(-1, logits.size(-1)), shifted_targets.view(-1))
+
+        # TODO: IMPLEMENT Policy Gradient, RLOO, Focal loss, etc... 
         
         # Backward pass
         loss.backward()
@@ -459,66 +483,66 @@ class SLN:
         accuracy = (correct.sum() / correct.numel()).item()
         perplexity = torch.exp(loss).item()
         loss = loss.item()
-        if verbose:# Logging
-            print(f" Loss: {loss}", end='')
-            print(f" Accuracy: {accuracy * 100:.2f}%", end='')
-            print(f" Perplexity: {perplexity}", end='')
-            print(f" Learning Rate: {self.left_scheduler.get_last_lr()[0]}")
-            # pdb.set_trace()
+        if self.verbose:# Logging
+            print(f" LEFT Loss: {loss}", end='')
+            print(f" LEFT Accuracy: {accuracy * 100:.2f}%", end='')
+            print(f" LEFT Perplexity: {perplexity}", end='')
+            print(f" LEFT Learning Rate: {self.left_scheduler.get_last_lr()[0]}")
+           
             # for i in range(batch):
             #     print(f" Prediction: {self.tokenizer.decode(predictions[i,...], skip_special_tokens=False)}")
             #     print("")
             #     print("")
             print("-----"*50)
-    
-        #	 - loop over all IDLs, calc loss, and grad accumulate for left model
-        #	 - return metrics 
-        #		 - perplexity
-        #		 - loss
-        #		 - per tok accuracy
 
         return loss, perplexity, accuracy
     
-    def learn_right(IDL_ids, target_valences):# loss_fn = [CE,Focal,RLOO,PG,etc..]):
+    def learn_right(self, IDL_ids, target_valences):# loss_fn = [CE,Focal,RLOO,PG,etc..]):
         #	 - loop over all IDLs, calc loss, and grad accumulate for right model
         #	 - return metrics 
         #		 - loss
         #		 - classification_accuracy
         
-        IDL_ids = torch.cat([d["IDL_ids"].to(self.right_device_map["embed_in"]) for sub_dict in IDL_ids.values() for d in sub_dict])
-        valence_masks = torch.cat([d["valence_mask"].to(self.right_device_map["embed_in"]) for sub_dict in IDL_ids.values() for d in sub_dict])
-        attention_mask = torch.ones_like(IDL_ids).to(self.right_device_map["embed_in"])
+        input_ids = torch.cat([d["IDL_ids"].to(self.right_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
+        valence_masks = torch.cat([d["valence_mask"].to(self.right_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
+        attention_mask = torch.ones_like(input_ids).to(self.right_device_map["embed_in"])
 
         # fpass the model on all IDLs to get the valence_masks 
-        valence_probs = self._forward_right(IDL_ids, attention_mask)
-        
-        # Right shift the targets for autoregressive prediction
-        target_valences = target_valences.view(-1).long()
-        outputs_flat = valence_probs.view(-1, 2)  # Flatten the outputs
+        valence_probs = self._forward_right(input_ids, attention_mask).to(self.right_device_map["embed_out"]) # [batch, seq, 2]
 
+        batch_size, seq_len, vocab_size = valence_probs.shape 
+        target_valences_expanded = target_valences.expand(batch_size, -1) # [batch, seq]
+            
+        assert target_valences_expanded.shape[0] == valence_probs.shape[0]
+        assert target_valences_expanded.shape[1] == valence_probs.shape[1]
+        
+        valence_probs_flat = valence_probs.reshape(-1, valence_probs.size(-1))  # [batch*seq, 2]
+        target_valences_expanded_flat = target_valences_expanded.reshape(-1).long()    # [batch*seq]
+        target_valences_expanded_flat = target_valences_expanded_flat.to(self.right_device_map["embed_out"])
+            
         focal_loss = False
+        
         if focal_loss:
             # Calculate focal loss
             targets_one_hot = F.one_hot(target_valences, num_classes=2).float()
             loss = -1 * sigmoid_focal_loss(outputs_flat, targets_one_hot, alpha=2.0, gamma=4.0, reduction='mean')                
         else:
-
-            loss_fn = nn.CrossEntropyLoss()
-            loss = loss_fn(outputs_flat, target_valences.long())
+            criterion = nn.CrossEntropyLoss()
+            loss = criterion(valence_probs_flat, target_valences_expanded_flat)
 
         # Backward pass
         loss.backward()
         
         # Calculate metrics
-        predictions = torch.argmax(valence_probs, dim=-1)
-        correct = (predictions == target_valences).float()
+        predictions = torch.argmax(valence_probs_flat, dim=-1)
+        correct = (predictions == target_valences_expanded_flat).float()
         accuracy = (correct.sum() / correct.numel()).item()
         loss = loss.item()
-        if verbose:# Logging
-            print(f" Loss: {loss}", end='')
-            print(f" Accuracy: {accuracy * 100:.2f}%", end='')
-            print(f" Learning Rate: {self.right_scheduler.get_last_lr()[0]}")
-            # pdb.set_trace()
+        if self.verbose:# Logging
+            print(f" RIGHT Loss: {loss}", end='')
+            print(f" RIGHT Accuracy: {accuracy * 100:.2f}%", end='')
+            print(f" RIGHT Learning Rate: {self.right_scheduler.get_last_lr()[0]}")
+            
             # for i in range(batch):
             #     print(f" Prediction: {self.tokenizer.decode(predictions[i,...], skip_special_tokens=False)}")
             #     print("")
@@ -527,31 +551,31 @@ class SLN:
 
         return loss, accuracy
         
-    def update_weights_left(total_loss):
+    def update_weights_left(self, total_loss):
         # optim.step for both left / right
-        normed_grad = torch.nn.utils.clip_grad_norm_(current_left_model.parameters(), max_norm=1.).item()
+        normed_grad = torch.nn.utils.clip_grad_norm_(self.current_left_model.parameters(), max_norm=1.).item()
         self.optimizer_left.step()
-        scheduler.step(total_loss)
+        self.left_scheduler.step(total_loss)
         self.optimizer_left.zero_grad()
         torch.cuda.empty_cache()
         return normed_grad
         
-    def update_weights_right(total_loss):
+    def update_weights_right(self, total_loss):
         # optim.step for both left / right
         normed_grad = torch.nn.utils.clip_grad_norm_(self.current_right_model.parameters(), max_norm=1.).item()
         normed_grad_r = torch.nn.utils.clip_grad_norm_(self.valence_layer.parameters(), max_norm=1.).item()
         self.optimizer_right.step()
-        scheduler.step(total_loss)
+        self.right_scheduler.step(total_loss)
         self.optimizer_right.zero_grad()
         torch.cuda.empty_cache()
         return normed_grad + normed_grad_r
         
-    def save_checkpoints(iterr,left_loss,right_loss):
+    def save_checkpoints(self,iterr,left_loss,right_loss, left_model_directory, right_model_directory):
         
         # save left checkpoint
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         checkpoint_filename = f"left_checkpoint_{timestamp}_iter_{iterr}_loss_{left_loss:.2f}.pth"
-        checkpoint_filepath = os.path.join(self.left_model_directory, checkpoint_filename)
+        checkpoint_filepath = os.path.join(left_model_directory, checkpoint_filename)
         torch.save({
             'model_state_dict': self.current_left_model.state_dict(),
             'optimizer_state_dict': self.optimizer_left.state_dict(),
@@ -561,7 +585,7 @@ class SLN:
         
         # save right checkpoint
         checkpoint_filename = f"right_checkpoint_{timestamp}_iter_{iterr}_loss_{right_loss:.2f}.pth"
-        checkpoint_filepath = os.path.join(self.right_model_directory, checkpoint_filename)
+        checkpoint_filepath = os.path.join(right_model_directory, checkpoint_filename)
         torch.save({
             'model_state_dict': self.current_right_model.state_dict(),
             'valence_layer_state_dict': self.valence_layer.state_dict(),
