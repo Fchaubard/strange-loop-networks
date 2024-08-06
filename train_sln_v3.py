@@ -61,14 +61,14 @@ class ProgressiveTailMasking:
 
     def update_n(self, current_accuracy):
         self.accuracy_vector.append(current_accuracy)
-        if np.mean(self.accuracy_vector) >= self.accuracy_threshold and len(self.accuracy_vector)>self.cooldown:
+        if np.mean(self.accuracy_vector[(-self.cooldown):]) >= self.accuracy_threshold and len(self.accuracy_vector)>self.cooldown:
                 self.n += 1
-                self.cooldown_counter = 0
                 self.accuracy_vector = []
             
-    def __call__(self, output_tokens, current_accuracy,true_answer_len):
+    def __call__(self, output_tokens, current_accuracy, true_answer_len):
         input_tokens = self.mask_tokens(output_tokens,true_answer_len)
         self.update_n(current_accuracy)
+        
         return input_tokens
 
 
@@ -78,9 +78,11 @@ if __name__ == '__main__':
     #########
     # TRAINING CONFIG
     #########
-    
+    # Path to the JSON file
+    training_interaction_file = './training_interaction_file.json'
+
     train_configs = {}
-    train_configs["lr"] = 1e-4
+    train_configs["lr"] = 1e-5
     train_configs["weight_decay"] = 0.0001
     train_configs["betas"] = (0.99,0.999)
 
@@ -100,22 +102,23 @@ if __name__ == '__main__':
     train_configs["valence_input_alpha"] = 2.
     train_configs["reset_lr"] = True
 
-    train_configs["model_id"] = "EleutherAI/pythia-12b" 
+    # 410m, 1b, 1.4b, 2.8b, 6.9b, 12b
+    train_configs["model_id"] = "EleutherAI/pythia-410m" 
     wandb_project_name = "sln_training_pythia_"+train_configs["model_id"].replace("/","_")
 
     train_configs["start_from_raw"] = True # do not start from most recent checkpoints
     train_configs["trajectories_per_IDL"]=3
     train_configs["temperature"]=1.0
 
-    train_configs["ptm_accuracy_threshold"] = 0.98  # Example accuracy threshold
+    train_configs["ptm_accuracy_threshold"] = 0.97  # Example accuracy threshold
     train_configs["ptm_cooldown"] = 100  # Example cooldown period
     train_configs["ptm_random_replacement"] = False
-    train_configs['macro_batch_size'] = 5
+    train_configs['macro_batch_size'] = 4
 
     train_configs['total_steps'] = 10000
     train_configs['warmup_steps'] = 100
 
-    train_configs["checkpoint_every_n_iterrs"] = 1000
+    train_configs["checkpoint_every_n_iterrs"] = 3000
     
     decode_every_n_batches = 100
     include_wandb = True
@@ -213,7 +216,7 @@ if __name__ == '__main__':
     while True:
         # load a prompt and target from the dataset
         sample = dataset[iterr%dataset_size]
-        sample = dataset[0]
+        # sample = dataset[0]
 
         prompt = sln.special_tokens_dict["bos_token"] + sample["question"]
         target_response = sln.left_model_token + sample["answer"] + sln.special_tokens_dict["eos_token"]
@@ -233,6 +236,7 @@ if __name__ == '__main__':
                                         truncation=True, 
                                         add_special_tokens=True).input_ids.to(sln.left_model_device_list[0])
 
+
         # input into sln
         progressive_tail_masked_input_ids = ptm_masking_scheduler(full_target_ids, accuracy, max_len_target_response_ids)
 
@@ -241,11 +245,8 @@ if __name__ == '__main__':
         # fpass the sln, and get back all IDLs. Keep it in token form so we can easily calc loss
         IDL_ids = sln.forward(progressive_tail_masked_input_ids)
         
-        target_valences = (progressive_tail_masked_input_ids == full_target_ids).int()
-        
-        
         left_loss, left_perplexity, left_accuracy = sln.learn_left(IDL_ids, full_target_ids)
-        right_loss, right_classification_accuracy = sln.learn_right(IDL_ids, target_valences)
+        right_loss, right_classification_accuracy = sln.learn_right(IDL_ids, full_target_ids)
                     
         accuracy = left_accuracy # I care more that we are improving vs. knowing that we are not.. 
         
@@ -263,6 +264,20 @@ if __name__ == '__main__':
         # left_loss, left_perplexity, left_accuracy = left_result
         # right_loss, right_classification_accuracy = right_result
 
+        
+        try:
+            with open(training_interaction_file, 'r', encoding='utf-8') as file:
+                content = file.read().strip()  # Strip any leading/trailing whitespace
+                if content:  # Check if the file is not empty
+                    data = json.loads(content)
+                    # Update the verbose variable if the key exists and is a boolean
+                    if 'verbose' in data and isinstance(data['verbose'], bool) and data['verbose'] != sln.verbose:
+                        sln.verbose = data['verbose']
+                        print(f"RESETTING VERBOSITY to : {data['verbose']}")
+
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError) as e:
+            print(f"An error occurred trying to update from training_interaction_file.json: {e}")
+        
         if iterr % train_configs.macro_batch_size:
             normed_grad_left = sln.update_weights_left(left_loss)
             normed_grad_right = sln.update_weights_right(right_loss)
@@ -287,7 +302,7 @@ if __name__ == '__main__':
             
             
             
-        if iterr % train_configs.checkpoint_every_n_iterrs == 0:
+        if iterr % train_configs.checkpoint_every_n_iterrs == train_configs.checkpoint_every_n_iterrs-1:
             sln.save_checkpoints(iterr,left_loss,right_loss, left_model_directory, right_model_directory)
         iterr+=1
 

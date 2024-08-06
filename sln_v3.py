@@ -332,10 +332,15 @@ class SLN:
             probabilities = torch.softmax(logits / self.temperature, dim=-1)
                 
             # Sample from the probabilities
-            sampled_tokens = torch.multinomial(probabilities.view(-1, probabilities.size(-1)), 1)
+            sampled_tokens = torch.multinomial(probabilities.view(-1, probabilities.size(-1)), 1).T
             
-            # Reshape the sampled tokens to match the original shape
-            sampled_tokens = sampled_tokens.view(probabilities.size()[:-1])
+            bos_token_tensor = torch.full((1, 1), 
+                                          self.tokenizer.bos_token_id, 
+                                          dtype=sampled_tokens.dtype, 
+                                          device=sampled_tokens.device)
+            
+            # Concatenate bos_token_tensor with sampled_tokens along the sequence dimension
+            sampled_tokens = torch.cat((bos_token_tensor, sampled_tokens[:,:-1]), dim=1)
             
             generated_tokens.append(sampled_tokens)
         
@@ -407,14 +412,25 @@ class SLN:
             
             IDL_ids[IDL_iterr] = []
             # Forward pass right model on all samples (initially will be just the input)
-            valence_mask = self._forward_right(generated_samples, attention_mask)[:,:,1]
+            valence_mask = self._forward_right(generated_samples, attention_mask)[:,:,1] # only need last channel.. for reward
             
             for i in range(valence_mask.shape[0]):
                 
                 total_valence = torch.sum(valence_mask[i,...]).item() 
-                sample = generated_samples[i,...]
+                sample = generated_samples[i].to(self.left_device_map["embed_in"])
+                valence_mask_fixed = valence_mask[i].to(self.right_device_map["embed_out"])
                 
-                IDL_ids[IDL_iterr].append( {"valence_mask":valence_mask[i,...].unsqueeze(0),
+                # # remove the eos at the end and prepend a bos token to "restart the process"
+                # if generated_samples[i,0].item() != self.tokenizer.bos_token_id:
+                    
+                #     sample = torch.cat((torch.tensor([self.tokenizer.bos_token_id]).to(self.left_device_map["embed_in"]), 
+                #                         sample[:-1]),  dim=-1)
+                    
+                #     valence_mask_fixed = torch.cat((torch.tensor([1.0]).to(self.right_device_map["embed_out"]), 
+                #                                     valence_mask_fixed[:-1]), dim=-1)
+                
+                
+                IDL_ids[IDL_iterr].append( {"valence_mask":valence_mask_fixed.unsqueeze(0),
                                         "IDL_ids":sample.unsqueeze(0),
                                         "IDL_string":self.tokenizer._decode(sample.tolist()),
                                         "total_valence":total_valence
@@ -497,25 +513,35 @@ class SLN:
 
         return loss, perplexity, accuracy
     
-    def learn_right(self, IDL_ids, target_valences):# loss_fn = [CE,Focal,RLOO,PG,etc..]):
+    def learn_right(self, IDL_ids, target_ids):# loss_fn = [CE,Focal,RLOO,PG,etc..]):
         #	 - loop over all IDLs, calc loss, and grad accumulate for right model
         #	 - return metrics 
         #		 - loss
         #		 - classification_accuracy
         
         input_ids = torch.cat([d["IDL_ids"].to(self.right_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
-        valence_masks = torch.cat([d["valence_mask"].to(self.right_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
+        
         attention_mask = torch.ones_like(input_ids).to(self.right_device_map["embed_in"])
+
+        target_ids = target_ids.to(self.right_device_map["embed_in"])
 
         # fpass the model on all IDLs to get the valence_masks 
         valence_probs = self._forward_right(input_ids, attention_mask).to(self.right_device_map["embed_out"]) # [batch, seq, 2]
 
-        batch_size, seq_len, vocab_size = valence_probs.shape 
-        target_valences_expanded = target_valences.expand(batch_size, -1) # [batch, seq]
-            
+        batch_size, seq_len, _ = valence_probs.shape 
+        target_valences_expanded = target_ids.expand(batch_size, -1)
+
+        
+        target_valences_expanded = (input_ids == target_valences_expanded).int()
+        
+        if self.verbose:
+            print(target_valences_expanded)
+            print(torch.sum(target_valences_expanded))
+            print(target_valences_expanded.shape)
+        
         assert target_valences_expanded.shape[0] == valence_probs.shape[0]
         assert target_valences_expanded.shape[1] == valence_probs.shape[1]
-        
+
         valence_probs_flat = valence_probs.reshape(-1, valence_probs.size(-1))  # [batch*seq, 2]
         target_valences_expanded_flat = target_valences_expanded.reshape(-1).long()    # [batch*seq]
         target_valences_expanded_flat = target_valences_expanded_flat.to(self.right_device_map["embed_out"])
@@ -555,7 +581,7 @@ class SLN:
         # optim.step for both left / right
         normed_grad = torch.nn.utils.clip_grad_norm_(self.current_left_model.parameters(), max_norm=1.).item()
         self.optimizer_left.step()
-        self.left_scheduler.step(total_loss)
+        self.left_scheduler.step()
         self.optimizer_left.zero_grad()
         torch.cuda.empty_cache()
         return normed_grad
@@ -565,7 +591,7 @@ class SLN:
         normed_grad = torch.nn.utils.clip_grad_norm_(self.current_right_model.parameters(), max_norm=1.).item()
         normed_grad_r = torch.nn.utils.clip_grad_norm_(self.valence_layer.parameters(), max_norm=1.).item()
         self.optimizer_right.step()
-        self.right_scheduler.step(total_loss)
+        self.right_scheduler.step()
         self.optimizer_right.zero_grad()
         torch.cuda.empty_cache()
         return normed_grad + normed_grad_r
