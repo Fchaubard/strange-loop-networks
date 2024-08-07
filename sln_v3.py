@@ -257,7 +257,7 @@ class SLN:
 
             self.left_scheduler = LambdaLR(self.optimizer_left, lr_lambda)
             self.right_scheduler = LambdaLR(self.optimizer_right, lr_lambda)
-            torch.cuda.empty_cache()
+            
             
         print("consciousness booted! Give me a prompt:") 
     
@@ -378,7 +378,8 @@ class SLN:
     def _stopping_criteria(self, IDL_count, valence):
         # return True if we should stop IDL, False if we should not
         if IDL_count > self.IDL_limit:
-            print("hit IDL_count limit, stopping..")
+            if self.verbose:
+                print("Hit IDL_count limit.")
             return False #break out of IDL
         else:
             average_valence = torch.mean(valence)
@@ -409,7 +410,7 @@ class SLN:
         IDL_iterr = 0
     
         while True:
-            
+          try:
             IDL_ids[IDL_iterr] = []
             # Forward pass right model on all samples (initially will be just the input)
             valence_mask = self._forward_right(generated_samples, attention_mask)[:,:,1] # only need last channel.. for reward
@@ -459,8 +460,12 @@ class SLN:
             generated_samples = self._generate_samples_from_logits(logits)
             
             IDL_iterr += 1
-
-        return IDL_ids
+          except RuntimeError as e:
+            print(f"Error updating weights: {e}")
+            print("continuing....")
+            
+        self.IDL_ids = IDL_ids
+        return self.IDL_ids
 
     def learn_left(self, IDL_ids, target_ids): 
 
@@ -579,46 +584,50 @@ class SLN:
         
     def update_weights_left(self, total_loss):
         # optim.step for both left / right
+        
         normed_grad = torch.nn.utils.clip_grad_norm_(self.current_left_model.parameters(), max_norm=1.).item()
         self.optimizer_left.step()
         self.left_scheduler.step()
         self.optimizer_left.zero_grad()
-        torch.cuda.empty_cache()
         return normed_grad
         
     def update_weights_right(self, total_loss):
         # optim.step for both left / right
+        
         normed_grad = torch.nn.utils.clip_grad_norm_(self.current_right_model.parameters(), max_norm=1.).item()
         normed_grad_r = torch.nn.utils.clip_grad_norm_(self.valence_layer.parameters(), max_norm=1.).item()
         self.optimizer_right.step()
         self.right_scheduler.step()
         self.optimizer_right.zero_grad()
-        torch.cuda.empty_cache()
+        
         return normed_grad + normed_grad_r
         
-    def save_checkpoints(self,iterr,left_loss,right_loss, left_model_directory, right_model_directory):
+    def save_checkpoints(self,iterr,left_loss,right_loss, left_model_directory, right_model_directory, return_names = False):
         
         # save left checkpoint
         timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
         checkpoint_filename = f"left_checkpoint_{timestamp}_iter_{iterr}_loss_{left_loss:.2f}.pth"
-        checkpoint_filepath = os.path.join(left_model_directory, checkpoint_filename)
+        left_checkpoint_filepath = os.path.join(left_model_directory, checkpoint_filename)
         torch.save({
             'model_state_dict': self.current_left_model.state_dict(),
             'optimizer_state_dict': self.optimizer_left.state_dict(),
             'loss': left_loss,
-        }, checkpoint_filepath)
-        print(f"Checkpoint saved at {checkpoint_filepath}")
+        }, left_checkpoint_filepath)
+        print(f"Checkpoint saved at {left_checkpoint_filepath}")
+
         
         # save right checkpoint
         checkpoint_filename = f"right_checkpoint_{timestamp}_iter_{iterr}_loss_{right_loss:.2f}.pth"
-        checkpoint_filepath = os.path.join(right_model_directory, checkpoint_filename)
+        right_checkpoint_filepath = os.path.join(right_model_directory, checkpoint_filename)
         torch.save({
             'model_state_dict': self.current_right_model.state_dict(),
             'valence_layer_state_dict': self.valence_layer.state_dict(),
             'optimizer_state_dict': self.optimizer_right.state_dict(),
             'loss': right_loss,
-        }, checkpoint_filepath)
-        print(f"Checkpoint saved at {checkpoint_filepath}")
+        }, right_checkpoint_filepath)
+        print(f"Checkpoint saved at {right_checkpoint_filepath}")
+        if return_names:
+            return left_checkpoint_filepath, right_checkpoint_filepath
 
 if __name__ == "__main__":
     print("Booting consciousness... one sec.. :)")

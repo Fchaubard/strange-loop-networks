@@ -15,7 +15,7 @@ import json
 from datetime import datetime
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
-
+import subprocess
 from torchvision.ops import sigmoid_focal_loss
 import sys
 from torch.optim.lr_scheduler import LambdaLR
@@ -103,7 +103,7 @@ if __name__ == '__main__':
     train_configs["reset_lr"] = True
 
     # 410m, 1b, 1.4b, 2.8b, 6.9b, 12b
-    train_configs["model_id"] = "EleutherAI/pythia-410m" 
+    train_configs["model_id"] = "EleutherAI/pythia-6.9b" 
     wandb_project_name = "sln_training_pythia_"+train_configs["model_id"].replace("/","_")
 
     train_configs["start_from_raw"] = True # do not start from most recent checkpoints
@@ -177,8 +177,7 @@ if __name__ == '__main__':
                                          train_configs.ptm_cooldown, 
                                          sln.tokenizer.pad_token_id,
                                          random_replacement=train_configs.ptm_random_replacement)
-
-
+    
     # Check if the left_model_directory exists
     if not os.path.exists(left_model_directory):
         # If the directory does not exist, create it
@@ -214,6 +213,7 @@ if __name__ == '__main__':
     print("STARTING TRAINING")
     
     while True:
+      try:
         # load a prompt and target from the dataset
         sample = dataset[iterr%dataset_size]
         # sample = dataset[0]
@@ -282,18 +282,19 @@ if __name__ == '__main__':
             normed_grad_left = sln.update_weights_left(left_loss)
             normed_grad_right = sln.update_weights_right(right_loss)
                     
-            message = {"iterr":iterr,
-                   "left_loss": round(float(left_loss),5), 
-                   "left_perplexity": round(float(left_perplexity),5), 
-                   "left_accuracy": round(float(left_accuracy),5), 
-                   "left_lr": sln.optimizer_left.param_groups[0]['lr'],  
-                   "left_normed_grad": round(float(normed_grad_left),5),  
-                       
-                   "right_loss": round(float(right_loss),5), 
-                   "right_accuracy": round(float(right_classification_accuracy),5), 
-                   "right_lr": sln.optimizer_right.param_groups[0]['lr'],  
-                   "right_normed_grad": round(float(normed_grad_right),5),
-                   "ptm_masking_scheduler_n": ptm_masking_scheduler.n }
+            message = {
+                       "ptm_masking_scheduler_n": ptm_masking_scheduler.n,
+                       "left_loss": round(float(left_loss),5), 
+                       "right_loss": round(float(right_loss),5), 
+                       "left_accuracy": round(float(left_accuracy),5), 
+                       "right_accuracy": round(float(right_classification_accuracy),5), 
+                       "left_perplexity": round(float(left_perplexity),5), 
+                       "left_lr": sln.optimizer_left.param_groups[0]['lr'],  
+                       "right_lr": sln.optimizer_right.param_groups[0]['lr'],  
+                       "left_normed_grad": round(float(normed_grad_left),5),  
+                       "right_normed_grad": round(float(normed_grad_right),5),
+                        "iterr":iterr,
+                   }
 
             print(message)
             
@@ -304,7 +305,43 @@ if __name__ == '__main__':
             
         if iterr % train_configs.checkpoint_every_n_iterrs == train_configs.checkpoint_every_n_iterrs-1:
             sln.save_checkpoints(iterr,left_loss,right_loss, left_model_directory, right_model_directory)
-        iterr+=1
+        
+        
+      except Exception as e:
+          
+          print("ERROR!!!!!")
+          print("---")
+          print(e)
+          print("---")
+          print(torch.cuda.memory_summary())
+          print("---")
+          result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True)
+          print(result.stdout)
+          print("---")
+          print("saving checkpoints")
+          left_model_checkpoint_name, right_model_checkpoint_name = sln.save_checkpoints(iterr,
+                                                                                        left_loss,right_loss, 
+                                                                                        left_model_directory, 
+                                                                                        right_model_directory,
+                                                                                        return_names = True)
+          
+          print("saved! Reloading...")
+          sln = SLN(train_configs.model_id,
+             left_model_device_list,
+             right_model_device_list,
+             left_model_checkpoint_name=left_model_checkpoint_name, 
+             right_model_checkpoint_name=right_model_checkpoint_name, 
+             verbose=False, 
+             trajectories_per_IDL=train_configs.trajectories_per_IDL,
+             temperature=train_configs.temperature,
+             train_configs = train_configs
+            )
+          
+          print("reloaded!")
+          pdb.set_trace()
+          continue
+      iterr+=1
+          
 
 
 
