@@ -257,32 +257,30 @@ class SLN:
 
             self.left_scheduler = LambdaLR(self.optimizer_left, lr_lambda)
             self.right_scheduler = LambdaLR(self.optimizer_right, lr_lambda)
-            
-            
+
+        # this is for RL loss functions for the left lobe
+        self.baseline_reward = 0.0
+        
         print("consciousness booted! Give me a prompt:") 
     
 
 
     def _forward_model_multigpu(self, model, embeddings, attention_mask, device_map):
 
-        try:
-            hidden_states = embeddings.clone()
-            
-            if attention_mask.dim() == 2:
-                    # Assuming attention_mask shape is [batch_size, seq_len]
-                    attention_mask = attention_mask[:, None, None, :]  # Convert to [batch_size, 1, 1, seq_len]
-                
-            # Pass through each layer manually
-            for i, layer in enumerate(model.gpt_neox.layers):
-                hidden_states = hidden_states.to(device_map[i])
-                attention_mask = attention_mask.to(device_map[i])
-                hidden_states = layer(hidden_states, attention_mask)[0]
+        hidden_states = embeddings.clone()
         
-            hidden_states = model.gpt_neox.final_layer_norm(hidden_states.to(device_map["final_layer_norm"]))
-            logits = model.embed_out(hidden_states.to(device_map["embed_out"]))
-        except Exception as e:
-            print(e)
-            pdb.set_trace()
+        if attention_mask.dim() == 2:
+                # Assuming attention_mask shape is [batch_size, seq_len]
+                attention_mask = attention_mask[:, None, None, :]  # Convert to [batch_size, 1, 1, seq_len]
+            
+        # Pass through each layer manually
+        for i, layer in enumerate(model.gpt_neox.layers):
+            hidden_states = hidden_states.to(device_map[i])
+            attention_mask = attention_mask.to(device_map[i])
+            hidden_states = layer(hidden_states, attention_mask)[0]
+    
+        hidden_states = model.gpt_neox.final_layer_norm(hidden_states.to(device_map["final_layer_norm"]))
+        logits = model.embed_out(hidden_states.to(device_map["embed_out"]))
         return logits
 
     
@@ -323,14 +321,13 @@ class SLN:
     def _generate_samples_from_logits(self, logits):
 
         generated_tokens = []
-        
+        # Apply softmax to convert logits to probabilities
+        probabilities = torch.softmax(logits / self.temperature, dim=-1)
+              
         # we will generate self.trajectories_per_IDL samples 
         for i in range(self.trajectories_per_IDL):
             # generated_tokens = torch.argmax(model_outputs, dim=-1) # TODO: greedy sampling?? or be smarter..
-                
-            # Apply softmax to convert logits to probabilities
-            probabilities = torch.softmax(logits / self.temperature, dim=-1)
-                
+            
             # Sample from the probabilities
             sampled_tokens = torch.multinomial(probabilities.view(-1, probabilities.size(-1)), 1).T
             
@@ -371,9 +368,10 @@ class SLN:
                         attention_mask,
                         self.left_device_map
                         )
-
         
-        return logits
+        probabilities = torch.softmax(logits / self.temperature, dim=-1)
+        
+        return probabilities
 
     def _stopping_criteria(self, IDL_count, valence):
         # return True if we should stop IDL, False if we should not
@@ -399,10 +397,49 @@ class SLN:
             txt.append(self.tokenizer.decode(output_tokens.cpu().numpy()[i], skip_special_tokens=False))
         return txt 
 
-
-    def forward(self, input_token_ids):
-
+    
+    def compute_policy_gradients(self, probs, generated_samples, token_valences, baseline=None):
+        # Compute the log probabilities of the actions taken (i.e., generated_samples)
+        log_probs = torch.log(probs)
         
+        # Gather the log probabilities corresponding to the actions (generated_samples)
+        log_probs = log_probs.gather(2, generated_samples.unsqueeze(-1)).squeeze(-1)
+        
+        # If a baseline is provided, subtract it from the rewards
+        if baseline is not None:
+            token_valences = token_valences - baseline
+        
+        # Compute the policy gradient loss
+        loss = -(log_probs * token_valences).mean()
+        
+        return loss
+
+    def compute_policy_gradients_with_rloo(self, probs, generated_samples, token_valences):
+        # Compute the log probabilities of the actions taken (i.e., generated_samples)
+        log_probs = torch.log(probs)
+        
+        # Gather the log probabilities corresponding to the actions (generated_samples)
+        log_probs = log_probs.gather(2, generated_samples.unsqueeze(-1)).squeeze(-1)
+        
+        # Calculate the Leave-One-Out (RLOO) baseline
+        seq_len = token_valences.size(1)
+        
+        # Calculate the sum of rewards across the sequence
+        reward_sum = token_valences.sum(dim=1, keepdim=True)
+        
+        # Calculate RLOO baseline by subtracting the current reward and averaging the rest
+        rloo_baseline = (reward_sum - token_valences) / (seq_len - 1)
+        
+        # Subtract the RLOO baseline from the rewards
+        adjusted_rewards = token_valences - rloo_baseline
+        
+        # Compute the policy gradient loss
+        loss = -(log_probs * adjusted_rewards).mean()
+        
+        return loss
+
+    def forward(self, input_token_ids, target_ids = None):
+
         generated_samples = input_token_ids
         attention_mask = torch.ones_like(generated_samples).to(self.right_model_device_list[0])
         
@@ -414,7 +451,41 @@ class SLN:
             IDL_ids[IDL_iterr] = []
             # Forward pass right model on all samples (initially will be just the input)
             valence_mask = self._forward_right(generated_samples, attention_mask)[:,:,1] # only need last channel.. for reward
-            
+
+            if target_ids: # if you provide sln.forward() with target_ids, then we will backprop
+                ##########
+                # Backprop for this IDL
+                ##########
+                
+                # You should backward pass right model now. TODO
+                right_loss, right_classification_accuracy = self.learn_right_logits(generated_samples, 
+                                                                                    valence_mask, 
+                                                                                    target_ids,
+                                                                                    loss_fn=self.train_configs.right_loss_fn)
+                
+                if IDL_iterr>0:
+                    # You should backward pass left model now against the generated samples. TODO 
+                    left_loss, left_perplexity, left_accuracy = self.learn_left_logits(logits, 
+                                                                                       target_ids, 
+                                                                                       valence_mask=valence_mask, 
+                                                                                       loss_fn=self.train_configs.left_loss_fn)
+
+                    
+                    # # We may want to do learn_right_logits and learn_left_logits using ThreadPoolExecutor to run the functions in parallel:
+                    # with concurrent.futures.ThreadPoolExecutor() as executor:
+                    #     # Submit tasks to the executor
+                    #     future_left = executor.submit(self.learn_right_logits(generated_samples, valence_mask, target_ids,loss_fn=self.train_configs.right_loss_fn))
+                    #     future_right = executor.submit(self.learn_left_logits(logits, target_ids,valence_mask=valence_mask,loss_fn=self.train_configs.left_loss_fn))
+                        
+                    #     # Wait for both tasks to complete and get the results
+                    #     left_result = future_left.result()
+                    #     right_result = future_right.result()
+                    
+                    # # Unpack the results
+                    # left_loss, left_perplexity, left_accuracy = left_result
+                    # right_loss, right_classification_accuracy = right_result
+
+                
             for i in range(valence_mask.shape[0]):
                 
                 total_valence = torch.sum(valence_mask[i,...]).item() 
@@ -467,31 +538,36 @@ class SLN:
         self.IDL_ids = IDL_ids
         return self.IDL_ids
 
-    def learn_left(self, IDL_ids, target_ids): 
+    def learn_left_logits(self, logits, target_ids, valence_mask=None, loss_fn="CE"): 
 
-        input_ids = torch.cat([d["IDL_ids"].to(self.left_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
-        valence_masks = torch.cat([d["valence_mask"].to(self.left_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
-        attention_mask = torch.ones_like(input_ids).to(self.left_device_map["embed_in"])
-        
-        # fpass the model on all IDLs
-        logits = self._forward_left(input_ids, valence_masks, attention_mask, zero_out_bit_flag=None)
-
-        assert input_ids.shape[-1] == target_ids.shape[-1]
-        
-        # Right shift the targets for autoregressive prediction
-        
         batch_size, seq_len, vocab_size = logits.shape
-        target_ids = target_ids.expand(batch_size, -1)
+        target_ids_expanded = target_ids.expand(batch_size, -1)
         
-
-        shifted_targets = torch.zeros_like(input_ids)
-        shifted_targets[..., :-1] = target_ids[..., 1:]
+        shifted_targets = torch.zeros_like(logits)
+        shifted_targets[..., :-1] = target_ids_expanded[..., 1:]
         shifted_targets[..., -1] = self.tokenizer.eos_token_id
         shifted_targets = shifted_targets.to(self.left_device_map["embed_out"])
         
-        # Compute CE loss 
-        criterion = nn.CrossEntropyLoss()
-        loss = criterion(logits.view(-1, logits.size(-1)), shifted_targets.view(-1))
+        
+        if loss_fn=="CE":
+            
+            criterion = nn.CrossEntropyLoss()
+            loss = criterion(logits.view(-1, logits.size(-1)), shifted_targets.view(-1))
+            
+        elif loss_fn=="PG":
+            
+            pg_baseline_moving_average_alpha = 0.9
+            self.baseline_reward = self.baseline_reward * pg_baseline_moving_average_alpha + torch.sum(valence_mask).item() * (1-pg_baseline_moving_average_alpha)
+            
+            loss = self.compute_policy_gradients(probs, generated_samples, valence_mask, baseline=self.baseline_reward)
+            
+        elif loss_fn=="RLOO":
+            
+            loss = self.compute_policy_gradients_with_rloo(probs, generated_samples, valence_mask)
+            
+        else:
+            raise Exception(f"Invalid left loss_fn = {loss_fn}, please choose a correct one or implement this loss.")
+
 
         # TODO: IMPLEMENT Policy Gradient, RLOO, Focal loss, etc... 
         
@@ -516,30 +592,44 @@ class SLN:
             #     print("")
             print("-----"*50)
 
+        sln.left_loss = loss
+        sln.left_perplexity = perplexity
+        sln.left_accuracy = accuracy
+        
         return loss, perplexity, accuracy
+
+
     
-    def learn_right(self, IDL_ids, target_ids):# loss_fn = [CE,Focal,RLOO,PG,etc..]):
-        #	 - loop over all IDLs, calc loss, and grad accumulate for right model
-        #	 - return metrics 
-        #		 - loss
-        #		 - classification_accuracy
-        
-        input_ids = torch.cat([d["IDL_ids"].to(self.right_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
-        
-        attention_mask = torch.ones_like(input_ids).to(self.right_device_map["embed_in"])
+    def learn_left_with_forward(self, IDL_ids, target_ids): 
 
-        target_ids = target_ids.to(self.right_device_map["embed_in"])
+        input_ids = torch.cat([d["IDL_ids"].to(self.left_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
+        valence_masks = torch.cat([d["valence_mask"].to(self.left_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
+        attention_mask = torch.ones_like(input_ids).to(self.left_device_map["embed_in"])
+        
+        # fpass the model on all IDLs
+        logits = self._forward_left(input_ids, valence_masks, attention_mask, zero_out_bit_flag=None)
 
-        # fpass the model on all IDLs to get the valence_masks 
-        valence_probs = self._forward_right(input_ids, attention_mask).to(self.right_device_map["embed_out"]) # [batch, seq, 2]
+        assert input_ids.shape[-1] == target_ids.shape[-1]
+
+        loss, perplexity, accuracy = self.learn_left_logits(logits, target_ids, loss_fn="CE")
+        
+        return loss, perplexity, accuracy
+
+
+    
+    def learn_right_logits(self, input_ids, valence_probs, target_ids, loss_fn="CE"):# loss_fn = [CE,Focal,RLOO,PG,etc..]):
 
         batch_size, seq_len, _ = valence_probs.shape 
-        target_valences_expanded = target_ids.expand(batch_size, -1)
+        target_ids_expanded = target_ids.expand(batch_size, -1)
 
-        
-        target_valences_expanded = (input_ids == target_valences_expanded).int()
+        input_ids = input_ids.to(self.right_device_map["valence_layer"])
+        target_ids_expanded = target_ids_expanded.to(self.right_device_map["valence_layer"])
+        valence_probs = valence_probs.to(self.right_device_map["valence_layer"])
+        target_valences_expanded = (input_ids == target_ids_expanded).int()
         
         if self.verbose:
+            print(input_ids)
+            print(target_ids_expanded)
             print(target_valences_expanded)
             print(torch.sum(target_valences_expanded))
             print(target_valences_expanded.shape)
@@ -549,18 +639,19 @@ class SLN:
 
         valence_probs_flat = valence_probs.reshape(-1, valence_probs.size(-1))  # [batch*seq, 2]
         target_valences_expanded_flat = target_valences_expanded.reshape(-1).long()    # [batch*seq]
-        target_valences_expanded_flat = target_valences_expanded_flat.to(self.right_device_map["embed_out"])
             
         focal_loss = False
         
-        if focal_loss:
+        if loss_fn=="Focal":
             # Calculate focal loss
             targets_one_hot = F.one_hot(target_valences, num_classes=2).float()
             loss = -1 * sigmoid_focal_loss(outputs_flat, targets_one_hot, alpha=2.0, gamma=4.0, reduction='mean')                
-        else:
+        elif loss_fn=="CE":
             criterion = nn.CrossEntropyLoss()
             loss = criterion(valence_probs_flat, target_valences_expanded_flat)
 
+        else:
+            raise Exception(f"Invalid right loss function loss_fn {loss_fn}, please fix or implement.")
         # Backward pass
         loss.backward()
         
@@ -580,8 +671,34 @@ class SLN:
             #     print("")
             print("-----"*50)
 
-        return loss, accuracy
+        sln.right_loss = loss
+        sln.right_classification_accuracy = accuracy
         
+        return loss, accuracy
+
+
+    
+    def learn_right_with_forward(self, IDL_ids, target_ids):# loss_fn = [CE,Focal,RLOO,PG,etc..]):
+        #	 - loop over all IDLs, calc loss, and grad accumulate for right model
+        #	 - return metrics 
+        #		 - loss
+        #		 - classification_accuracy
+        
+        input_ids = torch.cat([d["IDL_ids"].to(self.right_device_map["embed_in"]) for sub_list in IDL_ids.values() for d in sub_list])
+        
+        attention_mask = torch.ones_like(input_ids).to(self.right_device_map["embed_in"])
+
+        target_ids = target_ids.to(self.right_device_map["embed_in"])
+
+        # fpass the model on all IDLs to get the valence_masks 
+        valence_probs = self._forward_right(input_ids, attention_mask) # [batch, seq, 2]
+
+        loss, accuracy = self.learn_right_logits(input_ids, valence_probs, target_ids)
+        
+        return loss, accuracy
+
+
+    
     def update_weights_left(self, total_loss):
         # optim.step for both left / right
         

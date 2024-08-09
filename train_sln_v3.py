@@ -103,7 +103,7 @@ if __name__ == '__main__':
     train_configs["reset_lr"] = True
 
     # 410m, 1b, 1.4b, 2.8b, 6.9b, 12b
-    train_configs["model_id"] = "EleutherAI/pythia-6.9b" 
+    train_configs["model_id"] = "EleutherAI/pythia-2.8b" 
     wandb_project_name = "sln_training_pythia_"+train_configs["model_id"].replace("/","_")
 
     train_configs["start_from_raw"] = True # do not start from most recent checkpoints
@@ -117,6 +117,9 @@ if __name__ == '__main__':
 
     train_configs['total_steps'] = 10000
     train_configs['warmup_steps'] = 100
+
+    train_configs['left_loss_fn'] = "CE"
+    train_configs['right_loss_fn'] = "CE"
 
     train_configs["checkpoint_every_n_iterrs"] = 3000
     
@@ -175,7 +178,7 @@ if __name__ == '__main__':
     ptm_masking_scheduler = ProgressiveTailMasking(sln.tokenizer.vocab_size, 
                                          train_configs.ptm_accuracy_threshold, 
                                          train_configs.ptm_cooldown, 
-                                         sln.tokenizer.pad_token_id,
+                                         sln.tokenizer.mask_token_id,
                                          random_replacement=train_configs.ptm_random_replacement)
     
     # Check if the left_model_directory exists
@@ -204,7 +207,7 @@ if __name__ == '__main__':
     dataset = load_dataset("openai/gsm8k", "main", split="train")
     dataset_size = len(dataset)
     
-    iterr=0
+    iterr=-1
     accuracy = 0.0
     
     ####################
@@ -214,12 +217,13 @@ if __name__ == '__main__':
     
     while True:
       try:
+        iterr+=1
         # load a prompt and target from the dataset
         sample = dataset[iterr%dataset_size]
-        # sample = dataset[0]
+        # sample = dataset[4483]
 
         prompt = sln.special_tokens_dict["bos_token"] + sample["question"]
-        target_response = sln.left_model_token + sample["answer"] + sln.special_tokens_dict["eos_token"]
+        target_response = sln.left_model_token + sample["answer"] + sln.special_tokens_dict["eos_token"] # WILL BE ADDED TO THE SHIFTED TARGET. ?? TODO
         
         full_target = prompt + target_response
 
@@ -243,27 +247,12 @@ if __name__ == '__main__':
         assert full_target_ids.shape == progressive_tail_masked_input_ids.shape
 
         # fpass the sln, and get back all IDLs. Keep it in token form so we can easily calc loss
-        IDL_ids = sln.forward(progressive_tail_masked_input_ids)
+        IDL_ids = sln.forward(progressive_tail_masked_input_ids, target_ids=full_target_ids)
         
-        left_loss, left_perplexity, left_accuracy = sln.learn_left(IDL_ids, full_target_ids)
-        right_loss, right_classification_accuracy = sln.learn_right(IDL_ids, full_target_ids)
+        # left_loss, left_perplexity, left_accuracy = sln.learn_left_with_forward(IDL_ids, full_target_ids)
+        # right_loss, right_classification_accuracy = sln.learn_right_with_forward(IDL_ids, full_target_ids)
                     
-        accuracy = left_accuracy # I care more that we are improving vs. knowing that we are not.. 
-        
-        # # Using ThreadPoolExecutor to run the functions in parallel
-        # with concurrent.futures.ThreadPoolExecutor() as executor:
-        #     # Submit tasks to the executor
-        #     future_left = executor.submit(sln.learn_left, IDL_ids, full_target_ids)
-        #     future_right = executor.submit(sln.learn_right, IDL_ids, full_target_ids)
-            
-        #     # Wait for both tasks to complete and get the results
-        #     left_result = future_left.result()
-        #     right_result = future_right.result()
-        
-        # # Unpack the results
-        # left_loss, left_perplexity, left_accuracy = left_result
-        # right_loss, right_classification_accuracy = right_result
-
+        accuracy = sln.left_accuracy # I care more that we are improving vs. knowing that we are not.. 
         
         try:
             with open(training_interaction_file, 'r', encoding='utf-8') as file:
@@ -279,16 +268,16 @@ if __name__ == '__main__':
             print(f"An error occurred trying to update from training_interaction_file.json: {e}")
         
         if iterr % train_configs.macro_batch_size:
-            normed_grad_left = sln.update_weights_left(left_loss)
-            normed_grad_right = sln.update_weights_right(right_loss)
+            normed_grad_left = sln.update_weights_left(sln.left_loss)
+            normed_grad_right = sln.update_weights_right(sln.right_loss)
                     
             message = {
                        "ptm_masking_scheduler_n": ptm_masking_scheduler.n,
-                       "left_loss": round(float(left_loss),5), 
-                       "right_loss": round(float(right_loss),5), 
-                       "left_accuracy": round(float(left_accuracy),5), 
-                       "right_accuracy": round(float(right_classification_accuracy),5), 
-                       "left_perplexity": round(float(left_perplexity),5), 
+                       "left_loss": round(float(sln.left_loss),5), 
+                       "right_loss": round(float(sln.right_loss),5), 
+                       "left_accuracy": round(float(sln.left_accuracy),5), 
+                       "right_accuracy": round(float(sln.right_classification_accuracy),5), 
+                       "left_perplexity": round(float(sln.left_perplexity),5), 
                        "left_lr": sln.optimizer_left.param_groups[0]['lr'],  
                        "right_lr": sln.optimizer_right.param_groups[0]['lr'],  
                        "left_normed_grad": round(float(normed_grad_left),5),  
@@ -304,7 +293,7 @@ if __name__ == '__main__':
             
             
         if iterr % train_configs.checkpoint_every_n_iterrs == train_configs.checkpoint_every_n_iterrs-1:
-            sln.save_checkpoints(iterr,left_loss,right_loss, left_model_directory, right_model_directory)
+            sln.save_checkpoints(iterr, sln.left_loss, sln.right_loss, left_model_directory, right_model_directory)
         
         
       except Exception as e:
@@ -318,29 +307,31 @@ if __name__ == '__main__':
           result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True)
           print(result.stdout)
           print("---")
-          print("saving checkpoints")
-          left_model_checkpoint_name, right_model_checkpoint_name = sln.save_checkpoints(iterr,
-                                                                                        left_loss,right_loss, 
-                                                                                        left_model_directory, 
-                                                                                        right_model_directory,
-                                                                                        return_names = True)
+          print(f"iterr:{iterr} full_target:{full_target}")
+
+          # print("saving checkpoints")
+          # left_model_checkpoint_name, right_model_checkpoint_name = sln.save_checkpoints(iterr,
+          #                                                                               left_loss,right_loss, 
+          #                                                                               left_model_directory, 
+          #                                                                               right_model_directory,
+          #                                                                               return_names = True)
           
-          print("saved! Reloading...")
-          sln = SLN(train_configs.model_id,
-             left_model_device_list,
-             right_model_device_list,
-             left_model_checkpoint_name=left_model_checkpoint_name, 
-             right_model_checkpoint_name=right_model_checkpoint_name, 
-             verbose=False, 
-             trajectories_per_IDL=train_configs.trajectories_per_IDL,
-             temperature=train_configs.temperature,
-             train_configs = train_configs
-            )
+          # print("saved! Reloading...")
+          # sln = SLN(train_configs.model_id,
+          #    left_model_device_list,
+          #    right_model_device_list,
+          #    left_model_checkpoint_name=left_model_checkpoint_name, 
+          #    right_model_checkpoint_name=right_model_checkpoint_name, 
+          #    verbose=False, 
+          #    trajectories_per_IDL=train_configs.trajectories_per_IDL,
+          #    temperature=train_configs.temperature,
+          #    train_configs = train_configs
+          #   )
           
-          print("reloaded!")
+          # print("reloaded!")
           pdb.set_trace()
           continue
-      iterr+=1
+      
           
 
 
