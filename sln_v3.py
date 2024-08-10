@@ -26,7 +26,8 @@ from torchvision.ops import sigmoid_focal_loss
 import sys
 from torch.optim.lr_scheduler import LambdaLR
 import math
-
+import concurrent
+import traceback
 import wandb
 import os
 sys.path.append('.')
@@ -259,7 +260,7 @@ class SLN:
             self.right_scheduler = LambdaLR(self.optimizer_right, lr_lambda)
 
         # this is for RL loss functions for the left lobe
-        self.baseline_reward = 0.0
+        self.baseline_reward = self.train_configs.baseline_reward_for_rl_loss   # -1.0
         
         print("consciousness booted! Give me a prompt:") 
     
@@ -450,32 +451,57 @@ class SLN:
           try:
             IDL_ids[IDL_iterr] = []
             # Forward pass right model on all samples (initially will be just the input)
-            valence_mask = self._forward_right(generated_samples, attention_mask)[:,:,1] # only need last channel.. for reward
-
-            if target_ids: # if you provide sln.forward() with target_ids, then we will backprop
+            valence_mask_probs = self._forward_right(generated_samples, attention_mask) # only need last channel.. for reward
+            valence_mask = valence_mask_probs[:,:,1]
+            # if valence_mask.dim()==2:
+            #     valence_mask = valence_mask.unsqueeze(0)
+            if target_ids!=None: # if you provide sln.forward() with target_ids, then we will backprop
                 ##########
                 # Backprop for this IDL
                 ##########
                 
-                # You should backward pass right model now. TODO
-                right_loss, right_classification_accuracy = self.learn_right_logits(generated_samples, 
-                                                                                    valence_mask, 
+               if IDL_iterr==0:
+                    # You should backward pass right model now. TODO
+                    right_loss, right_classification_accuracy = self.learn_right_logits(generated_samples, 
+                                                                                    valence_mask_probs, 
                                                                                     target_ids,
                                                                                     loss_fn=self.train_configs.right_loss_fn)
                 
-                if IDL_iterr>0:
-                    # You should backward pass left model now against the generated samples. TODO 
+               else:
+                    #You should backward pass left model now against the generated samples. TODO 
                     left_loss, left_perplexity, left_accuracy = self.learn_left_logits(logits, 
                                                                                        target_ids, 
+                                                                                       generated_samples=generated_samples,
                                                                                        valence_mask=valence_mask, 
                                                                                        loss_fn=self.train_configs.left_loss_fn)
 
+                    # You should backward pass right model now. TODO
+                    right_loss, right_classification_accuracy = self.learn_right_logits(generated_samples, 
+                                                                                    valence_mask_probs, 
+                                                                                    target_ids,
+                                                                                    loss_fn=self.train_configs.right_loss_fn)
+                   
+                    
                     
                     # # We may want to do learn_right_logits and learn_left_logits using ThreadPoolExecutor to run the functions in parallel:
                     # with concurrent.futures.ThreadPoolExecutor() as executor:
-                    #     # Submit tasks to the executor
-                    #     future_left = executor.submit(self.learn_right_logits(generated_samples, valence_mask, target_ids,loss_fn=self.train_configs.right_loss_fn))
-                    #     future_right = executor.submit(self.learn_left_logits(logits, target_ids,valence_mask=valence_mask,loss_fn=self.train_configs.left_loss_fn))
+                    #     # Submit tasks to the executor correctly
+                    #     future_right = executor.submit(
+                    #         self.learn_right_logits,  # Pass the function itself without calling it
+                    #         generated_samples,
+                    #         valence_mask_probs,
+                    #         target_ids,
+                    #         loss_fn=self.train_configs.right_loss_fn
+                    #     )
+                        
+                    #     future_left = executor.submit(
+                    #         self.learn_left_logits,  # Pass the function itself without calling it
+                    #         logits,
+                    #         target_ids,
+                    #         generated_samples,  # Ensure arguments are in the correct order
+                    #         valence_mask,
+                    #         loss_fn=self.train_configs.left_loss_fn
+                    #     )
                         
                     #     # Wait for both tasks to complete and get the results
                     #     left_result = future_left.result()
@@ -532,38 +558,47 @@ class SLN:
             
             IDL_iterr += 1
           except RuntimeError as e:
-            print(f"Error updating weights: {e}")
+            print(f"Error in fpass updating weights: {e}")
             print("continuing....")
+            raise Exception(e)
             
         self.IDL_ids = IDL_ids
         return self.IDL_ids
 
-    def learn_left_logits(self, logits, target_ids, valence_mask=None, loss_fn="CE"): 
+    def learn_left_logits(self, logits, target_ids, generated_samples=None, valence_mask=None, loss_fn="CE"): 
 
+        
         batch_size, seq_len, vocab_size = logits.shape
         target_ids_expanded = target_ids.expand(batch_size, -1)
         
-        shifted_targets = torch.zeros_like(logits)
+        shifted_targets = torch.zeros_like(logits[:,:,0])
         shifted_targets[..., :-1] = target_ids_expanded[..., 1:]
         shifted_targets[..., -1] = self.tokenizer.eos_token_id
         shifted_targets = shifted_targets.to(self.left_device_map["embed_out"])
         
-        
         if loss_fn=="CE":
             
             criterion = nn.CrossEntropyLoss()
-            loss = criterion(logits.view(-1, logits.size(-1)), shifted_targets.view(-1))
+            loss = criterion(logits.view(-1, logits.size(-1)), shifted_targets.view(-1).long())
             
         elif loss_fn=="PG":
             
             pg_baseline_moving_average_alpha = 0.9
             self.baseline_reward = self.baseline_reward * pg_baseline_moving_average_alpha + torch.sum(valence_mask).item() * (1-pg_baseline_moving_average_alpha)
+            probs = torch.softmax(logits / self.temperature, dim=-1)
+            probs = probs.repeat(generated_samples.size(0), 1, 1)
+            device = probs.device
+            valence_mask_cloned = (valence_mask.clone().detach().to(device) - self.valence_input_baseline)*self.valence_input_alpha
             
-            loss = self.compute_policy_gradients(probs, generated_samples, valence_mask, baseline=self.baseline_reward)
+            loss = self.compute_policy_gradients(probs, generated_samples.to(device), valence_mask_cloned, baseline=self.baseline_reward)
             
         elif loss_fn=="RLOO":
+            probs = torch.softmax(logits / self.temperature, dim=-1)
+            probs = probs.repeat(generated_samples.size(0), 1, 1)
+            device = probs.device
+            valence_mask_cloned = (valence_mask.clone().detach().to(device) - self.valence_input_baseline)*self.valence_input_alpha
             
-            loss = self.compute_policy_gradients_with_rloo(probs, generated_samples, valence_mask)
+            loss = self.compute_policy_gradients_with_rloo(probs, generated_samples, valence_mask_cloned)
             
         else:
             raise Exception(f"Invalid left loss_fn = {loss_fn}, please choose a correct one or implement this loss.")
@@ -572,7 +607,7 @@ class SLN:
         # TODO: IMPLEMENT Policy Gradient, RLOO, Focal loss, etc... 
         
         # Backward pass
-        loss.backward()
+        loss.backward(retain_graph=True)
         
         # Calculate metrics
         predictions = torch.argmax(logits, dim=-1)
@@ -592,10 +627,9 @@ class SLN:
             #     print("")
             print("-----"*50)
 
-        sln.left_loss = loss
-        sln.left_perplexity = perplexity
-        sln.left_accuracy = accuracy
-        
+        self.left_loss = loss
+        self.left_perplexity = perplexity
+        self.left_accuracy = accuracy
         return loss, perplexity, accuracy
 
 
@@ -619,6 +653,7 @@ class SLN:
     
     def learn_right_logits(self, input_ids, valence_probs, target_ids, loss_fn="CE"):# loss_fn = [CE,Focal,RLOO,PG,etc..]):
 
+        
         batch_size, seq_len, _ = valence_probs.shape 
         target_ids_expanded = target_ids.expand(batch_size, -1)
 
@@ -640,20 +675,20 @@ class SLN:
         valence_probs_flat = valence_probs.reshape(-1, valence_probs.size(-1))  # [batch*seq, 2]
         target_valences_expanded_flat = target_valences_expanded.reshape(-1).long()    # [batch*seq]
             
-        focal_loss = False
-        
         if loss_fn=="Focal":
             # Calculate focal loss
             targets_one_hot = F.one_hot(target_valences, num_classes=2).float()
             loss = -1 * sigmoid_focal_loss(outputs_flat, targets_one_hot, alpha=2.0, gamma=4.0, reduction='mean')                
         elif loss_fn=="CE":
             criterion = nn.CrossEntropyLoss()
+            
             loss = criterion(valence_probs_flat, target_valences_expanded_flat)
 
         else:
             raise Exception(f"Invalid right loss function loss_fn {loss_fn}, please fix or implement.")
+        
         # Backward pass
-        loss.backward()
+        loss.backward(retain_graph=True )
         
         # Calculate metrics
         predictions = torch.argmax(valence_probs_flat, dim=-1)
@@ -671,8 +706,8 @@ class SLN:
             #     print("")
             print("-----"*50)
 
-        sln.right_loss = loss
-        sln.right_classification_accuracy = accuracy
+        self.right_loss = loss
+        self.right_classification_accuracy = accuracy
         
         return loss, accuracy
 

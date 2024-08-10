@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import concurrent
 import wandb
 import os
+import traceback
 sys.path.append('.')
 sys.path.append(os.path.abspath(os.path.join('..', 'sentence_augs')))
 from text_corrupter import text_corrupter_negative, generate_match_mask
@@ -82,7 +83,7 @@ if __name__ == '__main__':
     training_interaction_file = './training_interaction_file.json'
 
     train_configs = {}
-    train_configs["lr"] = 1e-5
+    train_configs["lr"] = 1e-5*.001
     train_configs["weight_decay"] = 0.0001
     train_configs["betas"] = (0.99,0.999)
 
@@ -103,11 +104,11 @@ if __name__ == '__main__':
     train_configs["reset_lr"] = True
 
     # 410m, 1b, 1.4b, 2.8b, 6.9b, 12b
-    train_configs["model_id"] = "EleutherAI/pythia-2.8b" 
-    wandb_project_name = "sln_training_pythia_"+train_configs["model_id"].replace("/","_")
+    train_configs["model_id"] = "EleutherAI/pythia-410m" 
+    wandb_project_name = "sln_training_pythia_"+train_configs["model_id"].replace("/","_") + "_TEST_IGNORE"
 
     train_configs["start_from_raw"] = True # do not start from most recent checkpoints
-    train_configs["trajectories_per_IDL"]=3
+    train_configs["trajectories_per_IDL"]=30
     train_configs["temperature"]=1.0
 
     train_configs["ptm_accuracy_threshold"] = 0.97  # Example accuracy threshold
@@ -118,10 +119,11 @@ if __name__ == '__main__':
     train_configs['total_steps'] = 10000
     train_configs['warmup_steps'] = 100
 
-    train_configs['left_loss_fn'] = "CE"
-    train_configs['right_loss_fn'] = "CE"
+    train_configs['left_loss_fn'] = "PG" # "RLOO", "PG", "CE"
+    train_configs['right_loss_fn'] = "CE" # "Focal", "CE"
 
     train_configs["checkpoint_every_n_iterrs"] = 3000
+    train_configs["baseline_reward_for_rl_loss"] = 1
     
     decode_every_n_batches = 100
     include_wandb = True
@@ -219,8 +221,9 @@ if __name__ == '__main__':
       try:
         iterr+=1
         # load a prompt and target from the dataset
-        sample = dataset[iterr%dataset_size]
+        # sample = dataset[iterr%dataset_size]
         # sample = dataset[4483]
+        sample = dataset[0]
 
         prompt = sln.special_tokens_dict["bos_token"] + sample["question"]
         target_response = sln.left_model_token + sample["answer"] + sln.special_tokens_dict["eos_token"] # WILL BE ADDED TO THE SHIFTED TARGET. ?? TODO
@@ -300,14 +303,14 @@ if __name__ == '__main__':
           
           print("ERROR!!!!!")
           print("---")
-          print(e)
-          print("---")
-          print(torch.cuda.memory_summary())
-          print("---")
-          result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True)
-          print(result.stdout)
-          print("---")
-          print(f"iterr:{iterr} full_target:{full_target}")
+          traceback.print_exc()
+          # print("---")
+          # print(torch.cuda.memory_summary())
+          # print("---")
+          # result = subprocess.run(['nvidia-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True)
+          # print(result.stdout)
+          # print("---")
+          # print(f"iterr:{iterr} full_target:{full_target}")
 
           # print("saving checkpoints")
           # left_model_checkpoint_name, right_model_checkpoint_name = sln.save_checkpoints(iterr,
@@ -330,7 +333,8 @@ if __name__ == '__main__':
           
           # print("reloaded!")
           pdb.set_trace()
-          continue
+          raise Exception(e)
+          # continue
       
           
 
