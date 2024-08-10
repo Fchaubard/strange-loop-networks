@@ -83,7 +83,7 @@ if __name__ == '__main__':
     training_interaction_file = './training_interaction_file.json'
 
     train_configs = {}
-    train_configs["lr"] = 1e-5*.001
+    train_configs["lr"] = 1e-5 #* .01
     train_configs["weight_decay"] = 0.0001
     train_configs["betas"] = (0.99,0.999)
 
@@ -108,7 +108,7 @@ if __name__ == '__main__':
     wandb_project_name = "sln_training_pythia_"+train_configs["model_id"].replace("/","_") + "_TEST_IGNORE"
 
     train_configs["start_from_raw"] = True # do not start from most recent checkpoints
-    train_configs["trajectories_per_IDL"]=30
+    train_configs["trajectories_per_IDL"]=3
     train_configs["temperature"]=1.0
 
     train_configs["ptm_accuracy_threshold"] = 0.97  # Example accuracy threshold
@@ -119,8 +119,8 @@ if __name__ == '__main__':
     train_configs['total_steps'] = 10000
     train_configs['warmup_steps'] = 100
 
-    train_configs['left_loss_fn'] = "PG" # "RLOO", "PG", "CE"
-    train_configs['right_loss_fn'] = "CE" # "Focal", "CE"
+    train_configs['left_loss_fn'] = "CE" # "RLOO", "PG", "CE"
+    train_configs['right_loss_fn'] = "Focal" # "Focal", "CE"
 
     train_configs["checkpoint_every_n_iterrs"] = 3000
     train_configs["baseline_reward_for_rl_loss"] = 1
@@ -221,9 +221,9 @@ if __name__ == '__main__':
       try:
         iterr+=1
         # load a prompt and target from the dataset
-        # sample = dataset[iterr%dataset_size]
+        sample = dataset[iterr%dataset_size]
         # sample = dataset[4483]
-        sample = dataset[0]
+        # sample = dataset[0]
 
         prompt = sln.special_tokens_dict["bos_token"] + sample["question"]
         target_response = sln.left_model_token + sample["answer"] + sln.special_tokens_dict["eos_token"] # WILL BE ADDED TO THE SHIFTED TARGET. ?? TODO
@@ -252,8 +252,8 @@ if __name__ == '__main__':
         # fpass the sln, and get back all IDLs. Keep it in token form so we can easily calc loss
         IDL_ids = sln.forward(progressive_tail_masked_input_ids, target_ids=full_target_ids)
         
-        # left_loss, left_perplexity, left_accuracy = sln.learn_left_with_forward(IDL_ids, full_target_ids)
-        # right_loss, right_classification_accuracy = sln.learn_right_with_forward(IDL_ids, full_target_ids)
+        left_loss, left_perplexity, left_accuracy = sln.learn_left_with_forward(IDL_ids, full_target_ids)
+        right_loss, right_classification_accuracy = sln.learn_right_with_forward(IDL_ids, full_target_ids)
                     
         accuracy = sln.left_accuracy # I care more that we are improving vs. knowing that we are not.. 
         

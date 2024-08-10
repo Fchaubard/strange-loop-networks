@@ -370,9 +370,9 @@ class SLN:
                         self.left_device_map
                         )
         
-        probabilities = torch.softmax(logits / self.temperature, dim=-1)
+        # probabilities = torch.softmax(logits / self.temperature, dim=-1)
         
-        return probabilities
+        return logits
 
     def _stopping_criteria(self, IDL_count, valence):
         # return True if we should stop IDL, False if we should not
@@ -401,33 +401,36 @@ class SLN:
     
     def compute_policy_gradients(self, probs, generated_samples, token_valences, baseline=None):
         # Compute the log probabilities of the actions taken (i.e., generated_samples)
+        device = probs.device
         log_probs = torch.log(probs)
         
         # Gather the log probabilities corresponding to the actions (generated_samples)
-        log_probs = log_probs.gather(2, generated_samples.unsqueeze(-1)).squeeze(-1)
+        log_probs = log_probs.gather(2, generated_samples.unsqueeze(-1).to(device)).squeeze(-1)
         
         # If a baseline is provided, subtract it from the rewards
         if baseline is not None:
             token_valences = token_valences - baseline
         
         # Compute the policy gradient loss
-        loss = -(log_probs * token_valences).mean()
+        loss = -(log_probs * token_valences.to(device)).mean()
         
         return loss
 
     def compute_policy_gradients_with_rloo(self, probs, generated_samples, token_valences):
         # Compute the log probabilities of the actions taken (i.e., generated_samples)
+        device = probs.device
         log_probs = torch.log(probs)
         
         # Gather the log probabilities corresponding to the actions (generated_samples)
-        log_probs = log_probs.gather(2, generated_samples.unsqueeze(-1)).squeeze(-1)
+        log_probs = log_probs.gather(2, generated_samples.unsqueeze(-1).to(device)).squeeze(-1)
         
         # Calculate the Leave-One-Out (RLOO) baseline
         seq_len = token_valences.size(1)
         
         # Calculate the sum of rewards across the sequence
-        reward_sum = token_valences.sum(dim=1, keepdim=True)
-        
+        reward_sum = token_valences.sum(dim=1, keepdim=True).to(device)
+
+        token_valences = token_valences.to(device)
         # Calculate RLOO baseline by subtracting the current reward and averaging the rest
         rloo_baseline = (reward_sum - token_valences) / (seq_len - 1)
         
@@ -455,7 +458,8 @@ class SLN:
             valence_mask = valence_mask_probs[:,:,1]
             # if valence_mask.dim()==2:
             #     valence_mask = valence_mask.unsqueeze(0)
-            if target_ids!=None: # if you provide sln.forward() with target_ids, then we will backprop
+              
+            if False: #target_ids!=None: # if you provide sln.forward() with target_ids, then we will backprop
                 ##########
                 # Backprop for this IDL
                 ##########
@@ -645,7 +649,11 @@ class SLN:
 
         assert input_ids.shape[-1] == target_ids.shape[-1]
 
-        loss, perplexity, accuracy = self.learn_left_logits(logits, target_ids, loss_fn="CE")
+        loss, perplexity, accuracy = self.learn_left_logits(logits, 
+                                                            target_ids, 
+                                                            generated_samples=input_ids, 
+                                                            valence_mask=valence_masks,  
+                                                            loss_fn=self.train_configs.left_loss_fn)
         
         return loss, perplexity, accuracy
 
@@ -677,8 +685,8 @@ class SLN:
             
         if loss_fn=="Focal":
             # Calculate focal loss
-            targets_one_hot = F.one_hot(target_valences, num_classes=2).float()
-            loss = -1 * sigmoid_focal_loss(outputs_flat, targets_one_hot, alpha=2.0, gamma=4.0, reduction='mean')                
+            targets_one_hot = F.one_hot(target_valences_expanded_flat, num_classes=2).float()
+            loss = -1 * sigmoid_focal_loss(valence_probs_flat, targets_one_hot, alpha=2.0, gamma=4.0, reduction='mean')                
         elif loss_fn=="CE":
             criterion = nn.CrossEntropyLoss()
             
@@ -728,7 +736,7 @@ class SLN:
         # fpass the model on all IDLs to get the valence_masks 
         valence_probs = self._forward_right(input_ids, attention_mask) # [batch, seq, 2]
 
-        loss, accuracy = self.learn_right_logits(input_ids, valence_probs, target_ids)
+        loss, accuracy = self.learn_right_logits(input_ids, valence_probs, target_ids, loss_fn=self.train_configs.right_loss_fn)
         
         return loss, accuracy
 
