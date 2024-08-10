@@ -370,8 +370,6 @@ class SLN:
                         self.left_device_map
                         )
         
-        # probabilities = torch.softmax(logits / self.temperature, dim=-1)
-        
         return logits
 
     def _stopping_criteria(self, IDL_count, valence):
@@ -459,7 +457,7 @@ class SLN:
             # if valence_mask.dim()==2:
             #     valence_mask = valence_mask.unsqueeze(0)
               
-            if False: #target_ids!=None: # if you provide sln.forward() with target_ids, then we will backprop
+            if target_ids!=None: # if you provide sln.forward() with target_ids, then we will backprop
                 ##########
                 # Backprop for this IDL
                 ##########
