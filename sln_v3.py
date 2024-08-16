@@ -112,7 +112,7 @@ class SLN:
                  decrement_future_negative_logits_with_rewards=False,
                  add_thinking_space=False,
                  trajectories_per_IDL=3,
-                 IDL_limit = 3,
+                 IDL_limit = 1,
                  temperature=0.7,
                  train_configs=None
                 ):
@@ -179,15 +179,16 @@ class SLN:
             self.current_left_model = AutoModelForCausalLM.from_pretrained(self.base_model_id)
             self.current_left_model.resize_token_embeddings(len(self.tokenizer))
             self.current_left_model.load_state_dict(checkpoint['model_state_dict'])
+            self.left_device_map = split_model_across_gpus(self.current_left_model, self.left_model_device_list)
             
             if train_configs:
                 
-                self.optimizer_left = optim.AdamW(list(self.current_left_model.parameters()), lr=train_configs.lr, betas=train_configs.betas, weight_decay=train_configs.weight_decay)
+                self.optimizer_left = optim.AdamW(list(self.current_left_model.parameters()), lr=train_configs.left_lr, betas=train_configs.left_betas, weight_decay=train_configs.weight_decay)
                 self.optimizer_left.load_state_dict(checkpoint['optimizer_state_dict'])
                 
-            if train_configs.reset_lr:
-                for param_group in self.optimizer_left.param_groups:
-                    param_group['lr'] = train_configs.lr
+            # if train_configs.reset_lr:
+            #     for param_group in self.optimizer_left.param_groups:
+            #         param_group['lr'] = train_configs.left_lr
         else:
             # load from hf default
             print("STARTING LEFT WEIGHTS FROM DEFAULT")
@@ -195,10 +196,10 @@ class SLN:
             self.current_left_model.resize_token_embeddings(len(self.tokenizer))
             if train_configs:
                 
-                self.optimizer_left = optim.AdamW(list(self.current_left_model.parameters()), lr=train_configs.lr, betas=train_configs.betas, weight_decay=train_configs.weight_decay)
+                self.optimizer_left = optim.AdamW(list(self.current_left_model.parameters()), lr=train_configs.left_lr, betas=train_configs.left_betas, weight_decay=train_configs.weight_decay)
 
                 
-        self.left_device_map = split_model_across_gpus(self.current_left_model, self.left_model_device_list)
+            self.left_device_map = split_model_across_gpus(self.current_left_model, self.left_model_device_list)
           
         ####################
         # Setup right model
@@ -218,14 +219,17 @@ class SLN:
             )
             
             self.valence_layer.load_state_dict(checkpoint['valence_layer_state_dict'])
+            self.right_device_map = split_model_across_gpus(self.current_right_model, self.right_model_device_list)
+            self.right_device_map["valence_layer"] = self.right_model_device_list[-1]
+            self.valence_layer.to(self.right_device_map["valence_layer"])
             
             if train_configs:
-                self.optimizer_right = optim.AdamW(list(self.current_right_model.parameters()) + list(self.valence_layer.parameters()), lr=train_configs.lr, betas=train_configs.betas, weight_decay=train_configs.weight_decay)
+                self.optimizer_right = optim.AdamW(list(self.current_right_model.parameters()) + list(self.valence_layer.parameters()), lr=train_configs.right_lr, betas=train_configs.right_betas, weight_decay=train_configs.weight_decay)
                 
                 self.optimizer_right.load_state_dict(checkpoint['optimizer_state_dict'])
-                if train_configs.reset_lr:
-                    for param_group in self.optimizer_right.param_groups:
-                        param_group['lr'] = train_configs.lr
+                # if train_configs.reset_lr:
+                #     for param_group in self.optimizer_right.param_groups:
+                #         param_group['lr'] = train_configs.right_lr
         else:
             # load from hf default
             print("STARTING RIGHT WEIGHTS FROM DEFAULT")
@@ -238,11 +242,11 @@ class SLN:
             )
             
             if train_configs:
-                self.optimizer_right = optim.AdamW(list(self.current_right_model.parameters()) + list(self.valence_layer.parameters()), lr=train_configs.lr, betas=train_configs.betas, weight_decay=train_configs.weight_decay)
+                self.optimizer_right = optim.AdamW(list(self.current_right_model.parameters()) + list(self.valence_layer.parameters()), lr=train_configs.right_lr, betas=train_configs.right_betas, weight_decay=train_configs.weight_decay)
         
-        self.right_device_map = split_model_across_gpus(self.current_right_model, self.right_model_device_list)
-        self.right_device_map["valence_layer"] = self.right_model_device_list[-1]
-        self.valence_layer.to(self.right_device_map["valence_layer"])
+            self.right_device_map = split_model_across_gpus(self.current_right_model, self.right_model_device_list)
+            self.right_device_map["valence_layer"] = self.right_model_device_list[-1]
+            self.valence_layer.to(self.right_device_map["valence_layer"])
 
         if train_configs:
             self.optimizer_left.zero_grad()
@@ -286,8 +290,8 @@ class SLN:
 
     
     def _forward_right(self, input_ids, attention_mask, round=False):
-        input_ids = input_ids.to(self.right_device_map["embed_in"])
-        attention_mask = attention_mask.to(self.right_device_map["embed_in"])
+        input_ids = input_ids.clone().detach().to(self.right_device_map["embed_in"])
+        attention_mask = attention_mask.clone().detach().to(self.right_device_map["embed_in"])
         embeddings = self.current_right_model.gpt_neox.embed_in(input_ids)
         logits = self._forward_model_multigpu(self.current_right_model, embeddings, attention_mask, self.right_device_map)
         # logits = self.current_right_model(input_ids, attention_mask=attention_mask, return_dict=True).logits
@@ -303,9 +307,9 @@ class SLN:
     
     def _forward_left(self, input_ids, input_valence, attention_mask, zero_out_bit_flag=None):
         
-        input_ids = input_ids.to(self.left_device_map["embed_in"])
-        attention_mask = attention_mask.to(self.left_device_map["embed_in"])
-        input_valence = input_valence.to(self.left_device_map["embed_in"])
+        input_ids = input_ids.clone().detach().to(self.left_device_map["embed_in"])
+        attention_mask = attention_mask.clone().detach().to(self.left_device_map["embed_in"])
+        input_valence = input_valence.clone().detach().to(self.left_device_map["embed_in"])
         
         logits = self._forward_left_with_valence_input(
             self.current_left_model,
@@ -350,7 +354,7 @@ class SLN:
                                         input_ids, 
                                         token_valences, 
                                         attention_mask=None, 
-                                        alpha=1., 
+                                        alpha=2., 
                                         baseline=0.5):
         
         original_embeddings = current_left_model.get_input_embeddings()
@@ -361,7 +365,10 @@ class SLN:
         token_valences = (token_valences.clone().float() - baseline)*alpha
         # token_valences = token_valences.expand(-1, -1, embeddings.size(-1))
         # modified_embeddings = embeddings + token_valences
-        embeddings[:, :, -1] = token_valences.to(self.left_device_map["embed_in"])
+
+        update_embeddings_with_valences = False
+        if update_embeddings_with_valences:
+            embeddings[:, :, -1] = token_valences.to(self.left_device_map["embed_in"])
 
         logits = self._forward_model_multigpu(
                         self.current_left_model,
@@ -374,7 +381,7 @@ class SLN:
 
     def _stopping_criteria(self, IDL_count, valence):
         # return True if we should stop IDL, False if we should not
-        if IDL_count > self.IDL_limit:
+        if IDL_count >= self.IDL_limit:
             if self.verbose:
                 print("Hit IDL_count limit.")
             return False #break out of IDL
@@ -397,48 +404,124 @@ class SLN:
         return txt 
 
     
-    def compute_policy_gradients(self, probs, generated_samples, token_valences, baseline=None):
+    def compute_policy_gradients(self, probs, generated_samples, token_valences, moving_average_size=300):
         # Compute the log probabilities of the actions taken (i.e., generated_samples)
         device = probs.device
-        log_probs = torch.log(probs)
+        log_probs = torch.log(probs + 1e-9)
         
         # Gather the log probabilities corresponding to the actions (generated_samples)
         log_probs = log_probs.gather(2, generated_samples.unsqueeze(-1).to(device)).squeeze(-1)
         
-        # If a baseline is provided, subtract it from the rewards
-        if baseline is not None:
-            token_valences = token_valences - baseline
+        token_valences_centered = (token_valences - self.valence_input_baseline)*self.valence_input_alpha
         
-        # Compute the policy gradient loss
-        loss = -(log_probs * token_valences.to(device)).mean()
-        
-        return loss
-
-    def compute_policy_gradients_with_rloo(self, probs, generated_samples, token_valences):
-        # Compute the log probabilities of the actions taken (i.e., generated_samples)
-        device = probs.device
-        log_probs = torch.log(probs)
-        
-        # Gather the log probabilities corresponding to the actions (generated_samples)
-        log_probs = log_probs.gather(2, generated_samples.unsqueeze(-1).to(device)).squeeze(-1)
-        
-        # Calculate the Leave-One-Out (RLOO) baseline
         seq_len = token_valences.size(1)
         
         # Calculate the sum of rewards across the sequence
-        reward_sum = token_valences.sum(dim=1, keepdim=True).to(device)
+        reward_sum = token_valences_centered.sum(dim=1, keepdim=True).to(device)
 
-        token_valences = token_valences.to(device)
-        # Calculate RLOO baseline by subtracting the current reward and averaging the rest
-        rloo_baseline = (reward_sum - token_valences) / (seq_len - 1)
+        self.baseline_reward.extend(reward_sum.tolist()) 
+        if len(self.baseline_reward) > moving_average_size:
+            self.baseline_reward = self.baseline_reward[-1*moving_average_size:]
         
-        # Subtract the RLOO baseline from the rewards
-        adjusted_rewards = token_valences - rloo_baseline
+        reward_sum_normalized = (reward_sum - torch.mean(self.baseline_reward) )/ (torch.std(self.baseline_reward) + 1)
         
         # Compute the policy gradient loss
-        loss = -(log_probs * adjusted_rewards).mean()
+        loss = -(log_probs * reward_sum_normalized).mean()
         
         return loss
+
+
+    def compute_policy_gradients_with_rloo(self, probs, generated_samples, token_valences):
+        # if generated_samples.shape[0]<2:
+        #     raise Exception("generated_samples must be >2 for RLOO, we recommend big, like 30")
+        device = probs.device
+        
+        # Compute log probabilities
+        log_probs = torch.log(probs + 1e-9)
+    
+        # Gather the log probabilities corresponding to the actions (generated_samples)
+        log_probs = log_probs.gather(2, generated_samples.unsqueeze(-1).to(device)).squeeze(-1)
+    
+        # Sum log probabilities across the sequence to treat the entire sequence as a single action
+        log_probs_sum = log_probs.sum(dim=1, keepdim=True).to(device)
+    
+        # Calculate the Leave-One-Out (RLOO) baseline
+        seq_len = token_valences.size(0)
+        reward_sum_per_sample = token_valences.mean(dim=1, keepdim=True).to(device)
+        reward_sum_total = reward_sum_per_sample.sum()
+        rloo_baseline_mean_per_sample = (reward_sum_total - reward_sum_per_sample) / (seq_len - 1)
+        # rloo_baseline_std = reward_sum.std()
+    
+        # Adjust the rewards with the baseline and normalize
+        #advantage = (reward_sum_per_sample - rloo_baseline_mean_per_sample) #/ (1. + rloo_baseline_mean_per_sample.std())
+        advantage = reward_sum_per_sample
+        # Compute the policy gradient loss using the summed log probabilities
+        loss = -(log_probs_sum * advantage).mean()
+
+        # loss = loss/(1.0 + torch.abs(loss))
+        
+    
+        return loss
+
+    # def compute_policy_gradients_with_rloo(self, probs, generated_samples, token_valences):
+    #     if generated_samples.shape[0]<2:
+    #         raise Exception("generated_samples must be >2 for RLOO, we recommend big, like 30")
+    #     device = probs.device
+        
+    #     # Compute log probabilities
+    #     log_probs = torch.log(probs + 1e-9)
+    
+    #     # Gather the log probabilities corresponding to the actions (generated_samples)
+    #     log_probs = log_probs.gather(2, generated_samples.unsqueeze(-1).to(device)).squeeze(-1)
+    
+    #     # Sum log probabilities across the sequence to treat the entire sequence as a single action
+    #     log_probs_sum = log_probs.sum(dim=1, keepdim=True).to(device)
+    
+    #     # Calculate the Leave-One-Out (RLOO) baseline
+    #     seq_len = token_valences.size(1)
+    #     reward_sum = token_valences.sum(dim=1, keepdim=True).to(device)
+    #     rloo_baseline_average = reward_sum.mean()
+    #     rloo_baseline_std = reward_sum.std()
+    
+    #     # Adjust the rewards with the baseline and normalize
+    #     advantage = (reward_sum - rloo_baseline_average) / (rloo_baseline_std + 1.0)
+    
+    #     # Compute the policy gradient loss using the summed log probabilities
+    #     loss = -(log_probs_sum * advantage).mean()
+        
+    #     loss = loss/(1.0 + torch.abs(loss))
+        
+    #     # pdb.set_trace()
+    
+    #     return loss
+
+    # def compute_policy_gradients_with_rloo(self, probs, generated_samples, token_valences):
+    #     # Compute the log probabilities of the actions taken (i.e., generated_samples)
+    #     device = probs.device
+    #     log_probs = torch.log(probs + 1e-9)
+        
+    #     # Gather the log probabilities corresponding to the actions (generated_samples)
+    #     log_probs = log_probs.gather(2, generated_samples.unsqueeze(-1).to(device)).squeeze(-1)
+        
+    #     # Calculate the Leave-One-Out (RLOO) baseline
+    #     seq_len = token_valences.size(1)
+
+        
+    #     # Calculate the sum of rewards across the sequence
+    #     reward_sum = token_valences.sum(dim=1, keepdim=True).to(device)
+
+    #     token_valences = token_valences.to(device)
+
+    #     rloo_baseline = (reward_sum - token_valences) / (seq_len - 1)
+    
+    #     # Subtract the RLOO baseline from the rewards and normalize
+    #     adjusted_rewards = token_valences - rloo_baseline
+    #     adjusted_rewards = (adjusted_rewards - adjusted_rewards.mean()) / (adjusted_rewards.std() + 1.0)
+
+    #     # Compute the policy gradient loss
+    #     loss = -(log_probs * adjusted_rewards).mean()
+        
+    #     return loss
 
     def forward(self, input_token_ids, target_ids = None):
 
@@ -470,14 +553,16 @@ class SLN:
                                                                                     loss_fn=self.train_configs.right_loss_fn)
                 
                else:
-                    #You should backward pass left model now against the generated samples. TODO 
-                    left_loss, left_perplexity, left_accuracy = self.learn_left_logits(logits, 
-                                                                                       target_ids, 
-                                                                                       generated_samples=generated_samples,
-                                                                                       valence_mask=valence_mask, 
-                                                                                       loss_fn=self.train_configs.left_loss_fn)
+                    if self.right_classification_accuracy > 0.95:
+                        self.left_loss, self.left_perplexity, self.left_accuracy = self.learn_left_logits(logits, 
+                                                                                           target_ids, 
+                                                                                           generated_samples=generated_samples,
+                                                                                           valence_mask=valence_mask, 
+                                                                                           loss_fn=self.train_configs.left_loss_fn)
+                    else:
+                        self.left_loss, self.left_perplexity, self.left_accuracy = -.01,-.01, -.01
 
-                    # You should backward pass right model now. TODO
+                    
                     right_loss, right_classification_accuracy = self.learn_right_logits(generated_samples, 
                                                                                     valence_mask_probs, 
                                                                                     target_ids,
@@ -584,15 +669,11 @@ class SLN:
             loss = criterion(logits.view(-1, logits.size(-1)), shifted_targets.view(-1).long())
             
         elif loss_fn=="PG":
-            
-            pg_baseline_moving_average_alpha = 0.9
-            self.baseline_reward = self.baseline_reward * pg_baseline_moving_average_alpha + torch.sum(valence_mask).item() * (1-pg_baseline_moving_average_alpha)
             probs = torch.softmax(logits / self.temperature, dim=-1)
             probs = probs.repeat(generated_samples.size(0), 1, 1)
             device = probs.device
-            valence_mask_cloned = (valence_mask.clone().detach().to(device) - self.valence_input_baseline)*self.valence_input_alpha
             
-            loss = self.compute_policy_gradients(probs, generated_samples.to(device), valence_mask_cloned, baseline=self.baseline_reward)
+            loss = self.compute_policy_gradients(probs, generated_samples.to(device), valence_mask.clone().detach().to(device))
             
         elif loss_fn=="RLOO":
             probs = torch.softmax(logits / self.temperature, dim=-1)
@@ -601,6 +682,18 @@ class SLN:
             valence_mask_cloned = (valence_mask.clone().detach().to(device) - self.valence_input_baseline)*self.valence_input_alpha
             
             loss = self.compute_policy_gradients_with_rloo(probs, generated_samples, valence_mask_cloned)
+        elif loss_fn=="RLOO+CE":
+            probs = torch.softmax(logits / self.temperature, dim=-1)
+            probs = probs.repeat(generated_samples.size(0), 1, 1)
+            device = probs.device
+            valence_mask_cloned = (valence_mask.clone().detach().to(device) - self.valence_input_baseline)*self.valence_input_alpha
+
+            criterion = nn.CrossEntropyLoss()
+            loss1 = criterion(logits.view(-1, logits.size(-1)), shifted_targets.view(-1).long())
+
+            loss2 = self.compute_policy_gradients_with_rloo(probs, generated_samples, valence_mask_cloned)
+
+            loss = loss1 + loss2 * 10
             
         else:
             raise Exception(f"Invalid left loss_fn = {loss_fn}, please choose a correct one or implement this loss.")
@@ -609,7 +702,7 @@ class SLN:
         # TODO: IMPLEMENT Policy Gradient, RLOO, Focal loss, etc... 
         
         # Backward pass
-        loss.backward(retain_graph=True)
+        loss.backward()
         
         # Calculate metrics
         predictions = torch.argmax(logits, dim=-1)
@@ -668,6 +761,9 @@ class SLN:
         valence_probs = valence_probs.to(self.right_device_map["valence_layer"])
         target_valences_expanded = (input_ids == target_ids_expanded).int()
         
+        if self.train_configs.monotonic_negative_reward:
+            target_valences_expanded *= target_valences_expanded.cumprod(dim=1)
+            
         if self.verbose:
             print(input_ids)
             print(target_ids_expanded)
@@ -678,6 +774,12 @@ class SLN:
         assert target_valences_expanded.shape[0] == valence_probs.shape[0]
         assert target_valences_expanded.shape[1] == valence_probs.shape[1]
 
+        only_take_first_two = True
+        
+        if only_take_first_two and valence_probs.shape[0]>2:
+            valence_probs = valence_probs[2,...]
+            target_valences_expanded = target_valences_expanded[2,...]
+            
         valence_probs_flat = valence_probs.reshape(-1, valence_probs.size(-1))  # [batch*seq, 2]
         target_valences_expanded_flat = target_valences_expanded.reshape(-1).long()    # [batch*seq]
             
@@ -694,7 +796,7 @@ class SLN:
             raise Exception(f"Invalid right loss function loss_fn {loss_fn}, please fix or implement.")
         
         # Backward pass
-        loss.backward(retain_graph=True )
+        loss.backward( )
         
         # Calculate metrics
         predictions = torch.argmax(valence_probs_flat, dim=-1)
@@ -744,6 +846,7 @@ class SLN:
         # optim.step for both left / right
         
         normed_grad = torch.nn.utils.clip_grad_norm_(self.current_left_model.parameters(), max_norm=1.).item()
+
         self.optimizer_left.step()
         self.left_scheduler.step()
         self.optimizer_left.zero_grad()
