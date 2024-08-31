@@ -32,6 +32,7 @@ from text_corrupter import text_corrupter_negative, generate_match_mask
 
 from print_colored_text import print_colored_text
 from sln_v3 import SLN
+from timeout_decorator import timeout, TimeoutError
 
 os.environ["WANDB_API_KEY"] = "cce47709d839921f0b13533529f31c8af7f3f4dc"
 
@@ -47,7 +48,7 @@ class ProgressiveTailMasking:
         self.vocab_size = vocab_size
         self.accuracy_threshold = accuracy_threshold
         self.cooldown = cooldown
-        self.n = 5
+        self.n = 0
         self.mask_token_id = mask_token_id
         self.random_replacement = random_replacement  # could be "Mask", "RandomToken", or "RandomSample" methods
         self.accuracy_vector = []
@@ -92,6 +93,32 @@ class ProgressiveTailMasking:
 
 
 
+@timeout(60*3)  # Set a timeout of n seconds for this function
+def create_samples(program, samples_per_program):
+
+    exec(program, globals())
+    samples = [generate_math_problem() for _ in range(samples_per_program)]
+    return samples
+
+
+import re
+def clean_decimal_points(sample_dict):
+    def round_numbers(match):
+        num = float(match.group())
+        # Check if the number has more than two decimal places
+        if len(match.group().split('.')[-1]) > 2:
+            return f"{round(num, 2)}"
+        else:
+            return match.group()
+
+    # Iterate over all key-value pairs in the dictionary
+    for key, value in sample_dict.items():
+        # Find all numbers in the string and apply the round_numbers function
+        sample_dict[key] = re.sub(r'\d+\.\d+', round_numbers, value)
+
+    return sample_dict
+
+
 
 if __name__ == '__main__':
     
@@ -102,10 +129,10 @@ if __name__ == '__main__':
     training_interaction_file = './training_interaction_file.json'
 
     train_configs = {}
-    train_configs["left_lr"] = 1e-8
+    train_configs["left_lr"] = 1e-7
     train_configs["right_lr"] = 1e-5
     train_configs["weight_decay"] = 0.0001
-    train_configs["left_betas"] = (0.7, 0.9)
+    train_configs["left_betas"] = (0.8, 0.9)
     train_configs["right_betas"] = (0.99, 0.999)
     
 
@@ -114,7 +141,8 @@ if __name__ == '__main__':
     train_configs["patience"]=250
     train_configs["cooldown"]=250
 
-    train_configs["macro_batch_size"] = 30
+    train_configs["left_macro_batch_size"] = 200
+    train_configs["right_macro_batch_size"] = 5
     train_configs["max_microbatch_size"] = 2 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
     train_configs["max_ctx_len"] = 3000 # IMPORTANT TO INCREASE IF YOU HAVE MORE GPU RAM
   
@@ -127,9 +155,13 @@ if __name__ == '__main__':
 
     # 410m, 1b, 1.4b, 2.8b, 6.9b, 12b
     train_configs["model_id"] = "EleutherAI/pythia-410m" 
-    wandb_project_name = "sln_training_pythia_RLOO_focal_"+train_configs["model_id"].replace("/","_") + "_"
+    train_configs['left_loss_fn'] = "RLOO+CE" # "RLOO+CE","RLOO", "PG", "CE"
+    train_configs['right_loss_fn'] = "Focal" # "Focal", "CE"
 
-    train_configs["start_from_raw"] = False # do not start from most recent checkpoints
+
+    wandb_project_name = "sln_training_pythia_"+ train_configs['left_loss_fn'] + "_" + train_configs['right_loss_fn'] + "_"+train_configs["model_id"].replace("/","_") + "_"
+
+    train_configs["start_from_raw"] = True # do not start from most recent checkpoints
     train_configs["trajectories_per_IDL"]=3
     train_configs["IDL_limit"]=1
     train_configs["temperature"]=1.0
@@ -137,17 +169,24 @@ if __name__ == '__main__':
 
     train_configs["ptm_accuracy_threshold"] = 0.9  # Example accuracy threshold
     train_configs["ptm_cooldown"] = 100  # Example cooldown period
-    train_configs["ptm_random_replacement"] = "RandomSample" #"RandomSample", "RandomToken", "Mask"
+    train_configs["ptm_random_replacement"] = "RandomToken" #"RandomSample", "RandomToken", "Mask"
  
 
     train_configs['total_steps'] = 10000
     train_configs['warmup_steps'] = 100
 
-    train_configs['left_loss_fn'] = "RLOO" # "RLOO+CE","RLOO", "PG", "CE"
-    train_configs['right_loss_fn'] = "Focal" # "Focal", "CE"
 
     train_configs["checkpoint_every_n_iterrs"] = 3000
     train_configs["baseline_reward_for_rl_loss"] = 1
+
+    
+    train_configs["dataset_mode"] = "programatic_generation" #programatic_generation #standard
+    train_configs["samples_per_program"]  = 5 
+    train_configs["extra_samples_for_random_sample"]  = 2 #if we are doing RandomSample strategy, want to have extras
+    
+    gsm_file_path = "../sentence_augs/gsm8k_train_programs_with_self_refinement.txt"
+    program_delimiter = "-----------<this will be used to split on later>----------------"
+
     
     decode_every_n_batches = 100
     include_wandb = True
@@ -231,27 +270,86 @@ if __name__ == '__main__':
     print("Training with configs:")
     print(train_configs)
 
-    dataset = load_dataset("openai/gsm8k", "main", split="train")
-    dataset_size = len(dataset)
-    
+
+    if train_configs.dataset_mode == "programatic_generation":
+        list_of_programs = []
+        # Read the file
+        with open(gsm_file_path, 'r') as file:
+            # Read the entire content of the file
+            content = file.read()
+            
+            # Split the content based on the delimiter
+            list_of_programs = content.split(program_delimiter)
+        
+        # Strip any leading or trailing whitespace from each program
+        list_of_programs = [program.strip() for program in list_of_programs]
+        dataset = []
+        if len(list_of_programs)<1:
+            raise "list_of_programs is less than 1, make sure you have the right program file (i.e. gsm8k.txt)"
+            
+        print('# of programs to generate from: '+str(len(list_of_programs)))
+    elif train_configs.dataset_mode == "standard":
+        dataset = load_dataset("openai/gsm8k", "main", split="train")
+        
+    else:
+        raise "ERROR: train_configs.dataset_mode not set to a valid value:" + str(train_configs.dataset_mode)
+        
     iterr=-1
     accuracy = 0.0
+    
+    normed_grad_right = -1
+    normed_grad_left = -1
     
     ####################
     # Start Training!
     ####################
     print("STARTING TRAINING")
     
+    
     while True:
       try:
         iterr+=1
         # load a prompt and target from the dataset
-        sample = dataset[iterr%dataset_size]
-        # sample = dataset[4483]
-        # sample = dataset[0]
+        if train_configs.dataset_mode == "programatic_generation":
+            if len(dataset) <= train_configs.extra_samples_for_random_sample:
+                if sln.verbose:
+                    print("creating more samples for the dataset..")
+                # generate samples
+                program = random.choice(list_of_programs)
+                failure_counter = 0
+                failure_counter_thresh = 10
+                while True:
+                    try:
+                        dataset = create_samples(program, train_configs.samples_per_program + train_configs.extra_samples_for_random_sample)
+                        import datetime # this is bc sometimes the program has datetime in it and sometimes it has datetime.datetime in it.. very strange..
+                        break
+                    except Exception as e:
+                        output = f"!!!!!!!!!!! Error executing the generated program: {e}"
+                        print(output)
+                        print(program)
+                        print(failure_counter)
+                        print("="*50)
+                        failure_counter+=1
+                        if failure_counter>failure_counter_thresh:
+                            break
+                        else:
+                            continue
+            
+            sample = dataset[-1]
+            dataset.pop()
+            sample = clean_decimal_points(sample)
+            dataset_size = len(dataset)
+            
+        elif train_configs.dataset_mode == "standard":
+            dataset_size = len(dataset)
+            sample = dataset[iterr%dataset_size]
+            # sample = dataset[4483]
+            # sample = dataset[0]
+        else:
+            raise "ERROR: train_configs.dataset_mode not set to a valid value:" + str(train_configs.dataset_mode)
         
         prompt = sln.special_tokens_dict["bos_token"] + sample["question"]
-        target_response = sln.left_model_token + sample["answer"] + sln.special_tokens_dict["eos_token"] # WILL BE ADDED TO THE SHIFTED TARGET. ?? TODO
+        target_response = sln.left_model_token + sample["answer"] + sln.special_tokens_dict["eos_token"]
         
         full_target = prompt + target_response
 
@@ -271,7 +369,6 @@ if __name__ == '__main__':
 
         # input into sln
         if train_configs.ptm_random_replacement == "RandomSample":
-            dataset_size = len(dataset)
             random_sample = random.choice([i for i in range(dataset_size) if i != iterr])
             
             # Get the replacement target response from the random sample
@@ -317,13 +414,21 @@ if __name__ == '__main__':
 
         except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError) as e:
             print(f"An error occurred trying to update from training_interaction_file.json: {e}")
+
         
-        if iterr % train_configs.macro_batch_size:
-            if sln.right_classification_accuracy > 0.8:
-                normed_grad_left = sln.update_weights_left(sln.left_loss)
-            else:
-                normed_grad_left = -1
-            normed_grad_right = sln.update_weights_right(sln.right_loss)
+        if iterr % train_configs.left_macro_batch_size==0 or iterr % train_configs.right_macro_batch_size==0:
+            if iterr % train_configs.right_macro_batch_size==0:
+                if sln.verbose:
+                    print("updating right")
+                    
+                normed_grad_right = sln.update_weights_right(sln.right_loss)
+                
+            if iterr % train_configs.left_macro_batch_size==0:
+                if sln.verbose:
+                    print("updating left")
+                
+                if sln.right_classification_accuracy > 0.8:
+                    normed_grad_left = sln.update_weights_left(sln.left_loss)
                     
             message = {
                        "ptm_masking_scheduler_n": ptm_masking_scheduler.n,
@@ -384,7 +489,7 @@ if __name__ == '__main__':
           #   )
           
           # print("reloaded!")
-          pdb.set_trace()
+          # pdb.set_trace()
           raise Exception(e)
           # continue
       
