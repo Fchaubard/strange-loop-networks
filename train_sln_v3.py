@@ -129,10 +129,10 @@ if __name__ == '__main__':
     training_interaction_file = './training_interaction_file.json'
 
     train_configs = {}
-    train_configs["left_lr"] = 1e-7
+    train_configs["left_lr"] = 1e-5 #1e-7
     train_configs["right_lr"] = 1e-5
     train_configs["weight_decay"] = 0.0001
-    train_configs["left_betas"] = (0.8, 0.9)
+    train_configs["left_betas"] = (0.99, 0.999) #(0.8, 0.9)
     train_configs["right_betas"] = (0.99, 0.999)
     
 
@@ -155,8 +155,8 @@ if __name__ == '__main__':
 
     # 410m, 1b, 1.4b, 2.8b, 6.9b, 12b
     train_configs["model_id"] = "EleutherAI/pythia-410m" 
-    train_configs['left_loss_fn'] = "RLOO+CE" # "RLOO+CE","RLOO", "PG", "CE"
-    train_configs['right_loss_fn'] = "Focal" # "Focal", "CE"
+    train_configs['left_loss_fn'] = "CE" # "RLOO+CE","RLOO", "PG", "CE"
+    train_configs['right_loss_fn'] = "CE" # "Focal", "CE"
 
 
     wandb_project_name = "sln_training_pythia_"+ train_configs['left_loss_fn'] + "_" + train_configs['right_loss_fn'] + "_"+train_configs["model_id"].replace("/","_") + "_"
@@ -169,19 +169,19 @@ if __name__ == '__main__':
 
     train_configs["ptm_accuracy_threshold"] = 0.9  # Example accuracy threshold
     train_configs["ptm_cooldown"] = 100  # Example cooldown period
-    train_configs["ptm_random_replacement"] = "RandomToken" #"RandomSample", "RandomToken", "Mask"
+    train_configs["ptm_random_replacement"] = "RandomSample" #"RandomSample", "RandomToken", "Mask"
  
 
     train_configs['total_steps'] = 10000
     train_configs['warmup_steps'] = 100
 
 
-    train_configs["checkpoint_every_n_iterrs"] = 3000
+    train_configs["checkpoint_every_n_iterrs"] = 30000
     train_configs["baseline_reward_for_rl_loss"] = 1
 
     
     train_configs["dataset_mode"] = "programatic_generation" #programatic_generation #standard
-    train_configs["samples_per_program"]  = 5 
+    train_configs["samples_per_program"]  = 10
     train_configs["extra_samples_for_random_sample"]  = 2 #if we are doing RandomSample strategy, want to have extras
     
     gsm_file_path = "../sentence_augs/gsm8k_train_programs_with_self_refinement.txt"
