@@ -1,42 +1,11 @@
-Francois' SLN research:
+This is a research repo to research Strange Loop Networks. Use at your own risk! To see the most recent methods, please look at the commit history or leave a comment.
 
-The goal of this research is to test if SLNs can generalize better on the same train data.
-- CustomModel_Francois.py (in lm_eval for generating results)
-- train_right.py (train code for the right lobe.. valence model)
-- train_left.py (train code for the left lobe.. trajectory model)
-- batch_generator.py (create a bunch of batches to be pulled by both train_left and train_right)
-- sln_v2.py (once you have 2 checkpoints you like (left/right) then you can boot up consciousness and test it out!)
-- (depr) train_sft.py (train code for sft)
-- (depr) train_sln.py (train code for SLN)
-- (depr) sln_v1.py (SLN class definition)
-- (be sure to 'git clone https://github.com/Fchaubard/sentence_augs.git')
-
-# Step 1:
-Choose a pythia model and a dataset (i.e. EleutherAI/pythia-14m) and update the train files.
-
-# Step 2: (optional)
-SFT it with python3 train_sft.py
-That will produce a checkpoint with the best performing SFT model.
-
-# Step 3: 
-Generate batches with 'python3 generate_batches.py' in a screen to run forever.
-# Step 4: 
-Train the right model (valence model) with 'python3 train_right.py' in a screen to run forever.
-
-# Step 5: 
-Train the left model (trajectory model) with 'python3 train_left.py' in a screen to run forever.
-
-# Step 6: 
-Run Eval: Whenever you feel the models have converged and are not learning anymore.. you can run inference with lm_eval or otherwise (probably do not want to use lm_eval anymore..):
-- First we must update CustomModel_Francois to pull from the checkpoints. 
-- Then we must run something like this:
-lm_eval --model CustomModel_Francois --model_args model_id=EleutherAI/pythia-2.8b --tasks hellaswag,lambada_openai,gsm8k,winogrande,piqa,sciq,logiqa --include_path ./ --device cuda:0 --batch_size 8 
-or
-python -m lm_eval --model CustomModel_Francois --model_args model_id=EleutherAI/pythia-2.8b --tasks hellaswag,lambada_openai,gsm8k,winogrande,piqa,sciq,logiqa --include_path ./ --device cuda:0 --batch_size 8
-
-Now we will have eval results for DPO training procedure!
-
-# Step 7:
-Run lm_eval on the SLN model. 
-lm_eval --model CustomSLN_Francois --model_args model_id=EleutherAI/pythia-2.8b --tasks hellaswag,lambada_openai,gsm8k,winogrande,piqa,sciq,logiqa --include_path ./ --device cuda:0 --batch_size 8
-
+ABSTRACT:
+Since the advent of Generative Pretrained Transformer (Radford, et al. 2018), Ma- chine Learning researchers have taken Richard Sutton’s Bitter Lesson to the extreme, delivering more and more capable yet, larger and larger ”single-lobed” language models (LLMs). Despite their impressive capabilities, these models are inherently and architecturally limited, as they have no native mechanism to ”ponder” as humans do. Instead, they are forced to predict their first token instantly after the last token of the prompt without an ”inner dialogue”. They are not natively able to self-reflect before emitting tokens, which results in hallucinations. Additionally, they are not able to ”adapt” the amount of compute required to solve a task to the difficulty of the problem, allocating more compute for more difficult tasks and less compute for less. Also, learned ”basis functions” in a single layer can not be called more than once per token emission, instead, such a function must be learned in each layer if required to do so to natively solve a ”recursive prob- lem”, i.e. factorial, fibonacci, or search. Finally, modern LLMs can not natively self-improve via self-play, which limits the class of problems these models can solve, the skill-acquisition efficiency from which they learn, and the generalization ability to Out-of-Distribution (OOD) tasks.
+Inspired by the ”loopiness” and ”competition” of the two hemispheres in the human cerebral cortex, our research introduces a new class of neural network architectures called Strange-Loop Networks (SLNs) defined as any architecture that has (at least) 2 distinct models (left model θleft and right model θright) such that the input to the θleft is the output of the θright, and the input to the θright is the output of the θleft. They communicate in an Internal Dialogue Loop (IDL) until some stopping criteria is achieved, then emit an output externally. We show SLNs achieve significant improvement in generalization ability, holding model size, number of tokens, and context size constant, which Chollet, 2019 formally defines as ”the intelligence of a system IS”.
+We propose many instantiations of these SLNs that are possible. For example:
+1) In a ”tall” SLN configuration, we deploy two pretrained LLMs that are connected in a ”strange loop” where one outputs into the other and visa versa to simulate the dual hemispheres of the human brain and allow them to jointly learn to collaborate. These models engage in an ”Inner Dialogue Loop,” until they agree they have the answer, allowing them to collaborate with each other until both lobes are satisfied.
+2) In a ”wide” SLN configuration, a main gating neural network directs the computation to the left, right or output lobe, where the right and left lobes are instead very shallow, using only one gating neural network and one MOE (Mixture of Experts) layer allowing the model to compose functions infinitely, where the gating network decides which expert to invoke, and then invokes the expert repeatedly until stopping criteria. They continue discussing in an ”Inner Dialogue Loop,” until the main gating neural network is satisfied with the answer and then invokes the output neural network. This architecture permits the model to synthesize the output of a number of selected functions at each iteration and we prove this results in strong fluidity and abstraction.
+3) In a ”lateralized” SLN, we restrict one model’s output to specialize in outputting only a score for a trajectory and the other is permitted to output the full trajectory. This concept can be applied to tall or wide SLNs just the same. In this way, one can view θleft to be the ”Agent Model”, ”Actor”, ”Generator” or ”Student”, and θright to be the ”Reward Model”, ”Critic”, ”Discriminator” or ”Teacher”, depending on the training technique applied; i.e. RLHF, A2C, GAN, DPO, model distillation, etc.
+1
+In all cases, we train these SLNs jointly allowing the weights to specialize to their role in the partnership. Both θleft and θright are jointly learned to collaborate together to solve higher order problems. Thus, these ”lobes” learn a new language to efficiently communicate with each other and to stop when the two models are satisfied with their response. Our ”strange-loop” framework achieves remarkable improvements on GSM8k with just a 820m model of XX% which is comparable performance to a 8B model with 10x fewer weights and compute, proving SLNs are much more information-efficient achieving much higher generalization per parameter than traditional LLMs. The SLN architecture opens a new field of research and provides a crucial step towards creating more generalizable, and perhaps even self-aware, AI systems. We release all code, demos, and datasets at https://github.com/fchaubard/
